@@ -1,0 +1,66 @@
+[package]
+name = "riallm"
+version = "0.1.0"
+edition = "2021"
+description = "Rust implementation of AirLLM - memory-optimized LLM inference with layer-by-layer loading"
+license = "Apache-2.0"
+repository = "https://github.com/riallm/riallm"
+keywords = ["llm", "inference", "memory-optimization", "cuda", "machine-learning"]
+categories = ["science"]
+
+[dependencies]
+# Core ML framework - HuggingFace's Rust ML library
+candle-core = { version = "0.8.0" }
+candle-nn = { version = "0.8.0" }
+candle-transformers = { version = "0.8.0" }
+candle-flash-attn = { version = "0.8.0", optional = true }
+
+# Safetensors for model file format
+safetensors = "0.4.0"
+
+# HuggingFace Hub for downloading models
+hf-hub = { version = "0.3.0", features = ["tokio"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Progress bars
+indicatif = "0.17"
+
+# Tokenization
+tokenizers = { version = "0.19.0", features = ["onig"] }
+
+# Utilities
+rayon = "1.8"
+memmap2 = "0.9"
+tempfile = "3.0"
+dirs = "5.0"
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+flash-attn = ["dep:candle-flash-attn", "cuda"]
+
+[dev-dependencies]
+tempfile = "3.0"
+env_logger = "0.10"
+
+[[example]]
+name = "basic_usage"
+path = "examples/basic_usage.rs"

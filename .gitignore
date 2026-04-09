@@ -1,0 +1,37 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Build
+/dist/
+/build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model files (large binaries)
+*.safetensors
+*.bin
+*.pt
+models/
+
+# Profiling data
+*.prof
+*.profraw
+*.profdata
+
+# Temporary files
+*.tmp
+*.temp
+
+# Logs
+*.log
