@@ -273,14 +273,31 @@ impl AirLLMBaseModel {
         
         match layer_name {
             "embed" => {
-                // Embedding lookup - for now, just return input as-is
-                // Full implementation would use candle_nn::Embedding
+                // Embedding lookup: convert token IDs to hidden states
                 if hidden_states.dims().len() == 2 {
-                    // Input is token IDs - would do embedding lookup here
-                    // For now, return as-is (placeholder)
-                    Ok(hidden_states.clone())
+                    // Input is token IDs [batch_size, seq_len]
+                    let embed_weight = layer_state.tensors.get("weight")
+                        .ok_or_else(|| RiallmError::ModelLoading("Embedding weight not found".to_string()))?;
+                    
+                    // Use candle's gather operation for embedding lookup
+                    // embed_weight shape: [vocab_size, hidden_size]
+                    // hidden_states shape: [batch_size, seq_len] (token IDs)
+                    // Result shape: [batch_size, seq_len, hidden_size]
+                    let hidden_size = embed_weight.dim(D::Minus1)?;
+                    
+                    // Flatten token IDs, gather embeddings, reshape
+                    let input_shape = hidden_states.shape();
+                    let flat_ids = hidden_states.flatten_all()?;
+                    
+                    // Gather rows from embedding matrix
+                    let embedded = embed_weight.index_select(&flat_ids, 0)?;
+                    
+                    // Reshape to [batch_size, seq_len, hidden_size]
+                    let batch_size = input_shape.dim(0)?;
+                    let seq_len = input_shape.dim(1)?;
+                    Ok(embedded.reshape((batch_size, seq_len, hidden_size))?)
                 } else {
-                    // Input is already embedded
+                    // Input is already embedded [batch_size, seq_len, hidden_size]
                     Ok(hidden_states.clone())
                 }
             }
@@ -322,20 +339,25 @@ impl AirLLMBaseModel {
     /// Forward pass for a transformer layer
     fn forward_transformer_layer(
         &self,
-        _layer_name: &str,
+        layer_name: &str,
         hidden_states: &Tensor,
-        _attention_mask: Option<&Tensor>,
+        attention_mask: Option<&Tensor>,
         tensors: &HashMap<String, Tensor>,
     ) -> Result<Tensor> {
+        // Extract layer index from name
+        let layer_idx: usize = layer_name.strip_prefix("layer_")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
         // Residual connection
         let mut hidden = hidden_states.clone();
-        
+
         // Attention norm
         let attn_norm_weight = tensors.get("input_layernorm.weight")
             .ok_or_else(|| RiallmError::ModelLoading("Attention norm weight not found".to_string()))?;
-        
+
         let normed = self.apply_rms_norm(&hidden, attn_norm_weight, self.config.rms_norm_eps)?;
-        
+
         // Self-attention
         let q_weight = tensors.get("self_attn.q_proj.weight")
             .ok_or_else(|| RiallmError::ModelLoading("Q weight not found".to_string()))?;
@@ -345,19 +367,26 @@ impl AirLLMBaseModel {
             .ok_or_else(|| RiallmError::ModelLoading("V weight not found".to_string()))?;
         let o_weight = tensors.get("self_attn.o_proj.weight")
             .ok_or_else(|| RiallmError::ModelLoading("O weight not found".to_string()))?;
-        
+
+        // Create position IDs for this layer
+        let seq_len = normed.dim(D::Minus2)?;
+        let position_ids = self.create_position_ids(seq_len, hidden_states.device())?;
+
         let (attn_output, _new_kv_cache) = self.apply_attention(
             &normed,
             q_weight,
             k_weight,
             v_weight,
             o_weight,
-            None, // TODO: Implement KV cache
+            None, // KV cache - TODO: integrate
+            Some(&position_ids),
+            attention_mask,
+            layer_idx,
         )?;
-        
+
         // Add attention residual
         hidden = hidden.add(&attn_output)?;
-        
+
         // Post-attention norm (if applicable)
         if self.layer_names.use_post_attention_layernorm {
             let ffn_norm_weight = tensors.get("post_attention_layernorm.weight")
@@ -406,62 +435,196 @@ impl AirLLMBaseModel {
         v_weight: &Tensor,
         o_weight: &Tensor,
         kv_cache: Option<(&Tensor, &Tensor)>,
+        position_ids: Option<&Tensor>,
+        attention_mask: Option<&Tensor>,
+        layer_idx: usize,
     ) -> Result<(Tensor, Option<(Tensor, Tensor)>)> {
         let (batch_size, seq_len, _) = hidden.dims3()?;
         let head_dim = self.config.hidden_size / self.config.num_attention_heads;
         let num_kv_heads = self.config.get_num_key_value_heads();
-        
+        let num_q_heads = self.config.num_attention_heads;
+
         // Project Q, K, V
         let q = hidden.matmul(&q_weight.t()?)?;
         let k = hidden.matmul(&k_weight.t()?)?;
         let v = hidden.matmul(&v_weight.t()?)?;
-        
+
         // Reshape to (batch, heads, seq, head_dim)
-        let q = q.reshape((
+        let mut q = q.reshape((
             batch_size,
             seq_len,
-            self.config.num_attention_heads,
+            num_q_heads,
             head_dim,
-        ))?.transpose(1, 2)?;
-        
-        let k = k.reshape((
+        ))?.transpose(1, 2)?.contiguous()?;
+
+        let mut k = k.reshape((
             batch_size,
             seq_len,
             num_kv_heads,
             head_dim,
-        ))?.transpose(1, 2)?;
-        
+        ))?.transpose(1, 2)?.contiguous()?;
+
         let v = v.reshape((
             batch_size,
             seq_len,
             num_kv_heads,
             head_dim,
         ))?.transpose(1, 2)?.contiguous()?;
-        
-        // TODO: Apply RoPE (rotary position embeddings)
-        // TODO: Handle KV cache
-        
+
+        // Apply RoPE (rotary position embeddings)
+        if let Some(pos_ids) = position_ids {
+            let rope_theta = self.config.rope_theta.unwrap_or(10000.0);
+            (q, k) = self.apply_rope(&q, &k, pos_ids, head_dim, rope_theta)?;
+        }
+
+        // Handle KV cache
+        let (k_to_use, v_to_use) = if let Some((k_cache, v_cache)) = kv_cache {
+            // Concatenate with cached KV
+            let k_cat = candle_core::ops::cat(&[k_cache, &k], 2)?;
+            let v_cat = candle_core::ops::cat(&[v_cache, &v], 2)?;
+            (k_cat, v_cat)
+        } else {
+            (k, v)
+        };
+
         // Scaled dot-product attention
         let scale = 1.0 / (head_dim as f64).sqrt();
-        let attn_weights = q.matmul(&k.t()?)?;
-        let attn_weights = (attn_weights * scale)?;
-        
-        // TODO: Apply attention mask
-        
+        let mut attn_weights = q.matmul(&k_to_use.t()?)?;
+        attn_weights = (attn_weights * scale)?;
+
+        // Apply attention mask (causal or provided)
+        if let Some(mask) = attention_mask {
+            attn_weights = attn_weights.add(mask)?;
+        } else if seq_len > 1 {
+            // Apply causal mask for generation
+            let causal_mask = self.create_causal_mask(seq_len, k_to_use.dim(2)?)?;
+            if let Some(mask) = causal_mask {
+                attn_weights = attn_weights.add(&mask)?;
+            }
+        }
+
         // Softmax
         let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
-        
+
         // Apply attention to values
-        let attn_output = attn_weights.matmul(&v)?;
-        
+        let attn_output = attn_weights.matmul(&v_to_use)?;
+
         // Reshape back to (batch, seq, hidden)
         let attn_output = attn_output.transpose(1, 2)?
             .reshape((batch_size, seq_len, self.config.hidden_size))?;
-        
+
         // Output projection
         let attn_output = attn_output.matmul(&o_weight.t()?)?;
+
+        Ok((attn_output, Some((k_to_use, v_to_use))))
+    }
+
+    /// Apply RoPE to Q and K tensors
+    fn apply_rope(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        position_ids: &Tensor,
+        head_dim: usize,
+        rope_theta: f32,
+    ) -> Result<(Tensor, Tensor)> {
+        let rope_dim = head_dim; // Use full head dim for RoPE
         
-        Ok((attn_output, None))
+        // Create inverse frequency tensor
+        let inv_freq: Vec<f32> = (0..rope_dim)
+            .step_by(2)
+            .map(|i| 1.0 / rope_theta.powf(i as f32 / rope_dim as f32))
+            .collect();
+        
+        let inv_freq_len = inv_freq.len();
+        let inv_freq_tensor = Tensor::from_vec(inv_freq, &[1, 1, inv_freq_len], q.device())?;
+        
+        // Get position_ids shape
+        let pos_shape = position_ids.shape();
+        let seq_len = pos_shape.dim(D::Minus1)?;
+        
+        // Expand position_ids to [1, seq_len, rope_dim/2]
+        let pos_expanded = position_ids.reshape((1, seq_len, 1))?;
+        let pos_broadcast = pos_expanded.broadcast_as((1, seq_len, inv_freq_len))?;
+        
+        // Compute freq matrix: [1, seq_len, rope_dim/2]
+        let freqs = pos_broadcast.mul(&inv_freq_tensor)?;
+        
+        // Create cos and sin: [1, seq_len, rope_dim/2]
+        let cos = freqs.cos()?;
+        let sin = freqs.sin()?;
+        
+        // Broadcast to [1, 1, seq_len, rope_dim/2] for q/k heads
+        let cos_4d = cos.reshape((1, 1, seq_len, inv_freq_len))?;
+        let sin_4d = sin.reshape((1, 1, seq_len, inv_freq_len))?;
+        
+        // Apply RoPE to q and k
+        let q_rope = self.rotate_half_and_apply(q, &cos_4d, &sin_4d, rope_dim)?;
+        let k_rope = self.rotate_half_and_apply(k, &cos_4d, &sin_4d, rope_dim)?;
+        
+        Ok((q_rope, k_rope))
+    }
+    
+    /// Apply rotary transformation: x * cos + rotate_half(x) * sin
+    fn rotate_half_and_apply(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        rope_dim: usize,
+    ) -> Result<Tensor> {
+        // Split x into two halves for rotation
+        let x_shape = x.shape();
+        let dims = x_shape.dims();
+        let head_dim = dims[3];
+        
+        // Split x into x1 and x2 (each half of the rope_dim)
+        let x1 = x.narrow(3, 0, rope_dim / 2)?;
+        let x2 = x.narrow(3, rope_dim / 2, rope_dim / 2)?;
+        
+        // rotate_half: [-x2, x1]
+        let neg_x2 = x2.neg()?;
+        let rotated = candle_core::ops::cat(&[&neg_x2, &x1], 3)?;
+        
+        // x * cos + rotated * sin
+        let x_cos = x.narrow(3, 0, rope_dim)?.mul(cos)?;
+        let rotated_sin = rotated.mul(sin)?;
+        let result = x_cos.add(&rotated_sin)?;
+        
+        // If rope_dim < head_dim, concatenate the unchanged part
+        if rope_dim < head_dim {
+            let unchanged = x.narrow(3, rope_dim, head_dim - rope_dim)?;
+            candle_core::ops::cat(&[&result, &unchanged], 3)
+        } else {
+            Ok(result)
+        }
+    }
+    
+    /// Create causal attention mask
+    fn create_causal_mask(&self, seq_len: usize, kv_seq_len: usize) -> Result<Option<Tensor>> {
+        if seq_len >= kv_seq_len {
+            return Ok(None); // No masking needed
+        }
+        
+        // Create lower triangular mask
+        let mask_data: Vec<f32> = (0..seq_len).flat_map(|i| {
+            (0..kv_seq_len).map(|j| {
+                if j > i {
+                    f32::NEG_INFINITY
+                } else {
+                    0.0
+                }
+            }).collect::<Vec<_>>()
+        }).collect();
+        
+        let mask = Tensor::from_vec(mask_data, &[1, 1, seq_len, kv_seq_len], &Device::Cpu)?;
+        Ok(Some(mask))
+    }
+    
+    /// Create position IDs tensor [seq_len]
+    fn create_position_ids(&self, seq_len: usize, device: &Device) -> Result<Tensor> {
+        let position_ids: Vec<u32> = (0..seq_len as u32).collect();
+        Tensor::from_vec(position_ids, &[seq_len], device)
     }
     
     /// Apply MLP (feed-forward network)
