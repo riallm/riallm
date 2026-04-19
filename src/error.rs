@@ -38,10 +38,10 @@ pub enum RiallmError {
 
     #[error("Tokenization error: {0}")]
     Tokenization(String),
-    
+
     #[error("Progress bar error: {0}")]
     ProgressBar(#[from] std::num::TryFromIntError),
-    
+
     #[error("CString error: {0}")]
     CString(#[from] std::ffi::NulError),
 }

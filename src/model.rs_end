@@ -1,0 +1,6 @@
+
+    /// Get the profiler for inspection
+    pub fn profiler(&self) -> Option<&Profiler> {
+        self.profiler.as_ref()
+    }
+}

@@ -22,21 +22,21 @@
 //! }
 //! ```
 
+pub mod adapters;
+pub mod auto_model;
 pub mod config;
+pub mod error;
+pub mod memory;
 pub mod model;
 pub mod persistence;
+pub mod profiler;
 pub mod quantization;
 pub mod utils;
-pub mod profiler;
-pub mod auto_model;
-pub mod error;
-pub mod adapters;
-pub mod memory;
 
 // Re-export main types for convenience
+pub use adapters::ModelAdapter;
 pub use auto_model::AutoModel;
 pub use config::ModelConfig;
 pub use error::Result;
 pub use model::AirLLMBaseModel;
 pub use persistence::SafetensorModelPersister;
-pub use adapters::ModelAdapter;

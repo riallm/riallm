@@ -12,10 +12,10 @@ use crate::error::{Result, RiallmError};
 pub trait ModelPersister: Send + Sync {
     /// Check if a layer exists at the given path
     fn layer_exists(&self, layer_path: &Path) -> bool;
-    
+
     /// Load a layer from disk
     fn load_layer(&self, layer_path: &Path) -> Result<HashMap<String, Tensor>>;
-    
+
     /// Save a layer to disk
     fn save_layer(&self, layer_path: &Path, tensors: &HashMap<String, Tensor>) -> Result<()>;
 }
@@ -30,7 +30,7 @@ impl SafetensorModelPersister {
     pub fn new(device: Device) -> Self {
         Self { device }
     }
-    
+
     /// Get the path to a layer shard file
     pub fn layer_path(base_path: &Path, layer_name: &str) -> PathBuf {
         base_path.join(format!("{}.safetensors", layer_name))
@@ -41,64 +41,61 @@ impl ModelPersister for SafetensorModelPersister {
     fn layer_exists(&self, layer_path: &Path) -> bool {
         layer_path.exists()
     }
-    
+
     fn load_layer(&self, layer_path: &Path) -> Result<HashMap<String, Tensor>> {
         if !layer_path.exists() {
-            return Err(RiallmError::LayerNotFound(
-                format!("Layer file not found: {:?}", layer_path)
-            ));
+            return Err(RiallmError::LayerNotFound(format!(
+                "Layer file not found: {:?}",
+                layer_path
+            )));
         }
-        
+
         let file = std::fs::File::open(layer_path)?;
         let file_size = file.metadata()?.len();
-        
+
         // Memory map the file for efficient loading
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-        
+
         // Parse safetensors
         let safetensors = SafeTensors::deserialize(&mmap)?;
-        
+
         let mut tensors = HashMap::new();
-        
+
         for tensor_view in safetensors.tensors() {
             let (name, view) = tensor_view;
             let dtype = view.dtype();
             let shape = view.shape();
             let data = view.data();
-            
+
             // Convert safetensors dtype to candle dtype
             let candle_dtype = safetensors_dtype_to_candle(dtype)?;
-            
+
             // Create tensor from raw bytes
-            let tensor = Tensor::from_raw_buffer(
-                data,
-                candle_dtype,
-                &shape,
-                &self.device,
-            )?;
-            
+            let tensor = Tensor::from_raw_buffer(data, candle_dtype, &shape, &self.device)?;
+
             tensors.insert(name, tensor);
         }
-        
+
         Ok(tensors)
     }
-    
+
     fn save_layer(&self, layer_path: &Path, tensors: &HashMap<String, Tensor>) -> Result<()> {
         // Ensure parent directory exists
         if let Some(parent) = layer_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        
+
         // Convert candle tensors to safetensors format
-        let mut tensor_data: HashMap<String, (Vec<u8>, candle_core::DType, Vec<usize>)> = HashMap::new();
-        
+        let mut tensor_data: HashMap<String, (Vec<u8>, candle_core::DType, Vec<usize>)> =
+            HashMap::new();
+
         for (name, tensor) in tensors {
             let bytes = tensor.flatten_all()?.to_vec1::<u8>()?;
             let dtype = tensor.dtype();
             let shape = tensor.shape().dims().to_vec();
             tensor_data.insert(name.clone(), (bytes, dtype, shape));
         }
-        
+
         // Create safetensors view
         let views: HashMap<String, safetensors::tensor::TensorView> = tensor_data
             .iter()
@@ -111,10 +108,10 @@ impl ModelPersister for SafetensorModelPersister {
                 Ok((name.clone(), view))
             })
             .collect::<Result<_>>()?;
-        
+
         // Serialize to file
         safetensors::serialize_to_file(views, &None, layer_path)?;
-        
+
         Ok(())
     }
 }
@@ -129,9 +126,10 @@ pub fn safetensors_dtype_to_candle(dtype: safetensors::Dtype) -> Result<candle_c
         safetensors::Dtype::U32 => Ok(candle_core::DType::U32),
         safetensors::Dtype::U8 => Ok(candle_core::DType::U8),
         safetensors::Dtype::BOOL => Ok(candle_core::DType::U8), // TODO: Handle bool properly
-        _ => Err(RiallmError::ModelLoading(
-            format!("Unsupported safetensors dtype: {:?}", dtype)
-        )),
+        _ => Err(RiallmError::ModelLoading(format!(
+            "Unsupported safetensors dtype: {:?}",
+            dtype
+        ))),
     }
 }
 
@@ -144,9 +142,10 @@ pub fn candle_dtype_to_safetensors(dtype: candle_core::DType) -> Result<safetens
         candle_core::DType::I64 => Ok(safetensors::Dtype::I64),
         candle_core::DType::U32 => Ok(safetensors::Dtype::U32),
         candle_core::DType::U8 => Ok(safetensors::Dtype::U8),
-        _ => Err(RiallmError::ModelLoading(
-            format!("Unsupported candle dtype: {:?}", dtype)
-        )),
+        _ => Err(RiallmError::ModelLoading(format!(
+            "Unsupported candle dtype: {:?}",
+            dtype
+        ))),
     }
 }
 

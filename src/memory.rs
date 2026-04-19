@@ -9,10 +9,10 @@ use crate::error::{Result, RiallmError};
 pub struct MemoryStats {
     /// Total memory in bytes
     pub total: u64,
-    
+
     /// Used memory in bytes
     pub used: u64,
-    
+
     /// Free memory in bytes
     pub free: u64,
 }
@@ -21,7 +21,7 @@ impl MemoryStats {
     pub fn new(total: u64, used: u64, free: u64) -> Self {
         Self { total, used, free }
     }
-    
+
     /// Get memory usage as percentage
     pub fn usage_percent(&self) -> f64 {
         if self.total == 0 {
@@ -30,7 +30,7 @@ impl MemoryStats {
             (self.used as f64 / self.total as f64) * 100.0
         }
     }
-    
+
     /// Format bytes to human-readable string
     pub fn format_bytes(bytes: u64) -> String {
         if bytes >= 1_073_741_824 {
@@ -43,7 +43,7 @@ impl MemoryStats {
             format!("{} B", bytes)
         }
     }
-    
+
     /// Print memory statistics
     pub fn print(&self, device_name: &str) {
         println!(
@@ -80,11 +80,11 @@ pub fn get_memory_stats(device: &Device) -> Result<MemoryStats> {
 pub fn clean_memory() -> Result<()> {
     // Trigger Rust garbage collection (not really needed in Rust, but useful for completeness)
     // In Rust, memory is freed deterministically when values go out of scope
-    
+
     // For CUDA devices, we can clear the cache
     // TODO: Implement CUDA cache clearing when candle supports it
     // candle_core::cuda::empty_cache()?;
-    
+
     Ok(())
 }
 
@@ -92,7 +92,7 @@ pub fn clean_memory() -> Result<()> {
 pub fn tensor_memory_bytes(tensor: &Tensor) -> Result<u64> {
     let elem_count = tensor.shape().elem_count();
     let dtype_size = dtype_size_bytes(tensor.dtype());
-    
+
     Ok((elem_count * dtype_size) as u64)
 }
 
@@ -115,11 +115,11 @@ pub fn move_tensors_to_device(
     device: &Device,
 ) -> Result<std::collections::HashMap<String, Tensor>> {
     let mut gpu_tensors = std::collections::HashMap::new();
-    
+
     for (name, tensor) in tensors {
         gpu_tensors.insert(name.clone(), tensor.to_device(device)?);
     }
-    
+
     Ok(gpu_tensors)
 }
 
@@ -134,38 +134,48 @@ pub fn move_tensors_to_cpu(
 /// Calculate total memory for a set of tensors
 pub fn total_tensor_memory(tensors: &std::collections::HashMap<String, Tensor>) -> Result<u64> {
     let mut total = 0u64;
-    
+
     for tensor in tensors.values() {
         total += tensor_memory_bytes(tensor)?;
     }
-    
+
     Ok(total)
 }
 
 /// Check if there's enough memory on the device
-pub fn check_device_memory(tensors: &std::collections::HashMap<String, Tensor>, device: &Device) -> Result<bool> {
+pub fn check_device_memory(
+    tensors: &std::collections::HashMap<String, Tensor>,
+    device: &Device,
+) -> Result<bool> {
     let required_memory = total_tensor_memory(tensors)?;
     let stats = get_memory_stats(device)?;
-    
+
     Ok(stats.free >= required_memory)
 }
 
 /// Print detailed memory information
-pub fn print_memory_info(tensors: &std::collections::HashMap<String, Tensor>, device_name: &str) -> Result<()> {
+pub fn print_memory_info(
+    tensors: &std::collections::HashMap<String, Tensor>,
+    device_name: &str,
+) -> Result<()> {
     println!("\n{} Memory Details:", device_name);
     println!("{}", "-".repeat(60));
-    
+
     let mut total_memory = 0u64;
-    
+
     for (name, tensor) in tensors {
         let mem = tensor_memory_bytes(tensor)?;
         total_memory += mem;
         println!("{:<40} {}", name, MemoryStats::format_bytes(mem));
     }
-    
+
     println!("{}", "-".repeat(60));
-    println!("{:<40} {}\n", "TOTAL", MemoryStats::format_bytes(total_memory));
-    
+    println!(
+        "{:<40} {}\n",
+        "TOTAL",
+        MemoryStats::format_bytes(total_memory)
+    );
+
     Ok(())
 }
 
@@ -191,10 +201,10 @@ pub fn synchronize_device(device: &Device) -> Result<()> {
 pub struct MemoryTracker {
     /// Peak memory usage
     peak_memory: u64,
-    
+
     /// Current memory usage
     current_memory: u64,
-    
+
     /// History of memory allocations
     history: Vec<(String, u64)>,
 }
@@ -207,51 +217,57 @@ impl MemoryTracker {
             history: Vec::new(),
         }
     }
-    
+
     /// Track a memory allocation
     pub fn track_allocation(&mut self, name: &str, bytes: u64) {
         self.current_memory += bytes;
         self.peak_memory = self.peak_memory.max(self.current_memory);
         self.history.push((name.to_string(), bytes));
     }
-    
+
     /// Track a memory deallocation
     pub fn track_deallocation(&mut self, name: &str, bytes: u64) {
         self.current_memory = self.current_memory.saturating_sub(bytes);
         self.history.push((format!("[free] {}", name), bytes));
     }
-    
+
     /// Get peak memory usage
     pub fn peak_memory(&self) -> u64 {
         self.peak_memory
     }
-    
+
     /// Get current memory usage
     pub fn current_memory(&self) -> u64 {
         self.current_memory
     }
-    
+
     /// Get allocation history
     pub fn history(&self) -> &[(String, u64)] {
         &self.history
     }
-    
+
     /// Print memory tracking summary
     pub fn print_summary(&self) {
         println!("\n{}", "=".repeat(60));
         println!("Memory Tracking Summary");
         println!("{}", "=".repeat(60));
-        println!("Peak Memory: {}", MemoryStats::format_bytes(self.peak_memory));
-        println!("Current Memory: {}", MemoryStats::format_bytes(self.current_memory));
+        println!(
+            "Peak Memory: {}",
+            MemoryStats::format_bytes(self.peak_memory)
+        );
+        println!(
+            "Current Memory: {}",
+            MemoryStats::format_bytes(self.current_memory)
+        );
         println!("\nAllocation History:");
-        
+
         for (name, bytes) in &self.history {
             println!("  {:<40} {}", name, MemoryStats::format_bytes(*bytes));
         }
-        
+
         println!("{}", "=".repeat(60));
     }
-    
+
     /// Reset tracking data
     pub fn reset(&mut self) {
         self.peak_memory = 0;

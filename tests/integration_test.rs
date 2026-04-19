@@ -8,18 +8,18 @@ use candle_core::{Device, Tensor};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use riallm::config::{ModelConfig, LayerNames, ModelOptions, CompressionType};
-    use riallm::error::Result;
-    use riallm::persistence::SafetensorModelPersister;
-    use riallm::quantization::{quantize_tensor, QuantizedTensor};
-    use riallm::profiler::Profiler;
-    use riallm::memory::{MemoryStats, MemoryTracker};
     use riallm::adapters::{create_adapter, ModelAdapter};
+    use riallm::config::{CompressionType, LayerNames, ModelConfig, ModelOptions};
+    use riallm::error::Result;
+    use riallm::memory::{MemoryStats, MemoryTracker};
+    use riallm::persistence::SafetensorModelPersister;
+    use riallm::profiler::Profiler;
+    use riallm::quantization::{quantize_tensor, QuantizedTensor};
 
     #[test]
     fn test_layer_names_llama() {
         let layer_names = LayerNames::for_arch("llama").unwrap();
-        
+
         assert_eq!(layer_names.embed, "model.embed_tokens");
         assert_eq!(layer_names.layer_prefix, "model.layers.");
         assert_eq!(layer_names.norm, "model.norm");
@@ -29,7 +29,7 @@ mod tests {
     #[test]
     fn test_layer_names_qwen2() {
         let layer_names = LayerNames::for_arch("qwen2").unwrap();
-        
+
         assert_eq!(layer_names.embed, "model.embed_tokens");
         assert_eq!(layer_names.layer_prefix, "model.layers.");
     }
@@ -37,7 +37,7 @@ mod tests {
     #[test]
     fn test_layer_names_mistral() {
         let layer_names = LayerNames::for_arch("mistral").unwrap();
-        
+
         assert_eq!(layer_names.embed, "model.embed_tokens");
         assert_eq!(layer_names.layer_prefix, "model.layers.");
     }
@@ -51,17 +51,26 @@ mod tests {
     #[test]
     fn test_compression_type_parsing() {
         use riallm::config::CompressionType;
-        
-        assert_eq!(CompressionType::from_str("none").unwrap(), CompressionType::None);
-        assert_eq!(CompressionType::from_str("4bit").unwrap(), CompressionType::FourBit);
-        assert_eq!(CompressionType::from_str("8bit").unwrap(), CompressionType::EightBit);
+
+        assert_eq!(
+            CompressionType::from_str("none").unwrap(),
+            CompressionType::None
+        );
+        assert_eq!(
+            CompressionType::from_str("4bit").unwrap(),
+            CompressionType::FourBit
+        );
+        assert_eq!(
+            CompressionType::from_str("8bit").unwrap(),
+            CompressionType::EightBit
+        );
         assert!(CompressionType::from_str("invalid").is_err());
     }
 
     #[test]
     fn test_model_options_default() {
         let options = ModelOptions::default();
-        
+
         assert_eq!(options.compression, CompressionType::None);
         assert!(options.prefetch_layers);
         assert!(!options.profiling_mode);
@@ -73,9 +82,9 @@ mod tests {
         let device = Device::Cpu;
         let data: Vec<f32> = (0..256).map(|x| x as f32 / 255.0).collect();
         let tensor = Tensor::from_vec(data.clone(), &[16, 16], &device).unwrap();
-        
+
         let quantized = quantize_tensor(&tensor, &CompressionType::EightBit).unwrap();
-        
+
         assert_eq!(quantized.qtype, CompressionType::EightBit);
         assert_eq!(quantized.shape, vec![16, 16]);
         assert!(!quantized.scales.is_empty());
@@ -86,9 +95,9 @@ mod tests {
         let device = Device::Cpu;
         let data: Vec<f32> = (0..128).map(|x| (x as f32 / 128.0) - 0.5).collect();
         let tensor = Tensor::from_vec(data.clone(), &[8, 16], &device).unwrap();
-        
+
         let quantized = quantize_tensor(&tensor, &CompressionType::FourBit).unwrap();
-        
+
         assert_eq!(quantized.qtype, CompressionType::FourBit);
         assert_eq!(quantized.shape, vec![8, 16]);
         assert!(!quantized.scales.is_empty());
@@ -97,23 +106,23 @@ mod tests {
     #[test]
     fn test_profiler() {
         let mut profiler = Profiler::new();
-        
+
         profiler.start_layer("layer_0");
         std::thread::sleep(std::time::Duration::from_millis(10));
         profiler.end_layer("layer_0");
-        
+
         profiler.start_layer("layer_1");
         std::thread::sleep(std::time::Duration::from_millis(20));
         profiler.end_layer("layer_1");
-        
+
         let stats_0 = profiler.get_layer_stats("layer_0").unwrap();
         let stats_1 = profiler.get_layer_stats("layer_1").unwrap();
-        
+
         assert_eq!(stats_0.execution_count, 1);
         assert_eq!(stats_1.execution_count, 1);
         assert!(stats_0.avg_forward_time_ms() > 0.0);
         assert!(stats_1.avg_forward_time_ms() > 0.0);
-        
+
         // Layer 1 should have taken longer
         assert!(stats_1.avg_forward_time_ms() > stats_0.avg_forward_time_ms() * 0.5);
     }
@@ -121,7 +130,7 @@ mod tests {
     #[test]
     fn test_memory_stats() {
         let stats = MemoryStats::new(1_073_741_824, 536_870_912, 536_870_912);
-        
+
         assert_eq!(stats.total, 1_073_741_824);
         assert_eq!(stats.used, 536_870_912);
         assert_eq!(stats.free, 536_870_912);
@@ -131,13 +140,13 @@ mod tests {
     #[test]
     fn test_memory_tracker() {
         let mut tracker = MemoryTracker::new();
-        
+
         tracker.track_allocation("tensor_1", 1_000_000);
         tracker.track_allocation("tensor_2", 2_000_000);
-        
+
         assert_eq!(tracker.current_memory(), 3_000_000);
         assert_eq!(tracker.peak_memory(), 3_000_000);
-        
+
         tracker.track_deallocation("tensor_1", 1_000_000);
         assert_eq!(tracker.current_memory(), 2_000_000);
         assert_eq!(tracker.peak_memory(), 3_000_000); // Peak should remain unchanged
@@ -161,10 +170,10 @@ mod tests {
             sliding_window: None,
             extra: HashMap::new(),
         };
-        
+
         let adapter = create_adapter("llama", config.clone()).unwrap();
         assert_eq!(adapter.model_type_name(), "llama");
-        
+
         let layer_names = adapter.get_layer_names();
         assert_eq!(layer_names.embed, "model.embed_tokens");
     }
@@ -187,7 +196,7 @@ mod tests {
             sliding_window: None,
             extra: HashMap::new(),
         };
-        
+
         let result = create_adapter("unsupported", config);
         assert!(result.is_err());
     }
