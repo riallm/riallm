@@ -14,10 +14,10 @@ use crate::profiler::Profiler;
 #[derive(Debug, Clone)]
 pub struct KVCACHE {
     /// Key cache per layer
-    pub key_cache: Vec<Tensor>,
+    pub key_cache: Vec<Option<Tensor>>,
 
     /// Value cache per layer
-    pub value_cache: Vec<Tensor>,
+    pub value_cache: Vec<Option<Tensor>>,
 
     /// Current sequence length
     pub seq_len: usize,
@@ -26,8 +26,8 @@ pub struct KVCACHE {
 impl KVCACHE {
     pub fn new(num_layers: usize) -> Self {
         Self {
-            key_cache: Vec::with_capacity(num_layers),
-            value_cache: Vec::with_capacity(num_layers),
+            key_cache: vec![None; num_layers],
+            value_cache: vec![None; num_layers],
             seq_len: 0,
         }
     }
@@ -171,6 +171,8 @@ impl AirLLMBaseModel {
             None
         };
 
+        let kv_cache = Some(KVCACHE::new(config.num_hidden_layers));
+
         Ok(Self {
             config,
             layer_names,
@@ -183,7 +185,7 @@ impl AirLLMBaseModel {
             layer_order,
             profiler,
             tokenizer_path: None,
-            kv_cache: None,
+            kv_cache,
             stream: None,
         })
     }
@@ -260,7 +262,7 @@ impl AirLLMBaseModel {
 
     /// Forward pass for a single layer
     fn forward_layer(
-        &self,
+        &mut self,
         layer_name: &str,
         hidden_states: &Tensor,
         attention_mask: Option<&Tensor>,
@@ -330,103 +332,111 @@ impl AirLLMBaseModel {
             }
 
             // Transformer layer
-            _ if layer_name.starts_with("layer_") => self.forward_transformer_layer(
-                layer_name,
-                hidden_states,
-                attention_mask,
-                &layer_state.tensors,
-            ),
+            _ if layer_name.starts_with("layer_") => {
+                let layer_idx: usize = layer_name
+                    .strip_prefix("layer_")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+
+                let tensors = &layer_state.tensors;
+
+                // Residual connection
+                let mut hidden = hidden_states.clone();
+
+                // Attention norm
+                let attn_norm_weight = tensors.get("input_layernorm.weight").ok_or_else(|| {
+                    RiallmError::ModelLoading("Attention norm weight not found".to_string())
+                })?;
+
+                let normed =
+                    self.apply_rms_norm(&hidden, attn_norm_weight, self.config.rms_norm_eps)?;
+
+                // Self-attention
+                let q_weight = tensors
+                    .get("self_attn.q_proj.weight")
+                    .ok_or_else(|| RiallmError::ModelLoading("Q weight not found".to_string()))?;
+                let k_weight = tensors
+                    .get("self_attn.k_proj.weight")
+                    .ok_or_else(|| RiallmError::ModelLoading("K weight not found".to_string()))?;
+                let v_weight = tensors
+                    .get("self_attn.v_proj.weight")
+                    .ok_or_else(|| RiallmError::ModelLoading("V weight not found".to_string()))?;
+                let o_weight = tensors
+                    .get("self_attn.o_proj.weight")
+                    .ok_or_else(|| RiallmError::ModelLoading("O weight not found".to_string()))?;
+
+                // Create position IDs for this layer
+                let seq_len = normed.dim(D::Minus2)?;
+                let pos_offset = self.kv_cache.as_ref().map(|c| c.seq_len).unwrap_or(0);
+                let position_ids =
+                    self.create_position_ids(seq_len, pos_offset, hidden_states.device())?;
+
+                // Extract KV cache for this layer
+                let kv_cache_layer = if let Some(cache) = &self.kv_cache {
+                    if let (Some(k), Some(v)) =
+                        (&cache.key_cache[layer_idx], &cache.value_cache[layer_idx])
+                    {
+                        Some((k, v))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let (attn_output, new_kv) = self.apply_attention(
+                    &normed,
+                    q_weight,
+                    k_weight,
+                    v_weight,
+                    o_weight,
+                    kv_cache_layer,
+                    Some(&position_ids),
+                    attention_mask,
+                )?;
+
+                // Update KV cache
+                if let (Some(cache), Some((nk, nv))) = (&mut self.kv_cache, new_kv) {
+                    cache.key_cache[layer_idx] = Some(nk.to_device(&self.cpu_device)?);
+                    cache.value_cache[layer_idx] = Some(nv.to_device(&self.cpu_device)?);
+                }
+
+                // Add attention residual
+                hidden = hidden.add(&attn_output)?;
+
+                // Post-attention norm (if applicable)
+                if self.layer_names.use_post_attention_layernorm {
+                    let ffn_norm_weight = tensors
+                        .get("post_attention_layernorm.weight")
+                        .ok_or_else(|| {
+                            RiallmError::ModelLoading("FFN norm weight not found".to_string())
+                        })?;
+
+                    hidden =
+                        self.apply_rms_norm(&hidden, ffn_norm_weight, self.config.rms_norm_eps)?;
+                }
+
+                // Feed-forward network
+                let gate_weight = tensors.get("mlp.gate_proj.weight").ok_or_else(|| {
+                    RiallmError::ModelLoading("Gate weight not found".to_string())
+                })?;
+                let up_weight = tensors
+                    .get("mlp.up_proj.weight")
+                    .ok_or_else(|| RiallmError::ModelLoading("Up weight not found".to_string()))?;
+                let down_weight = tensors.get("mlp.down_proj.weight").ok_or_else(|| {
+                    RiallmError::ModelLoading("Down weight not found".to_string())
+                })?;
+
+                let ffn_output = self.apply_mlp(&hidden, gate_weight, up_weight, down_weight)?;
+
+                // Add FFN residual
+                hidden = hidden.add(&ffn_output)?;
+
+                Ok(hidden)
+            }
 
             _ => Err(RiallmError::LayerNotFound(layer_name.to_string())),
         }
-    }
-
-    /// Forward pass for a transformer layer
-    fn forward_transformer_layer(
-        &self,
-        layer_name: &str,
-        hidden_states: &Tensor,
-        attention_mask: Option<&Tensor>,
-        tensors: &HashMap<String, Tensor>,
-    ) -> Result<Tensor> {
-        // Extract layer index from name
-        let layer_idx: usize = layer_name
-            .strip_prefix("layer_")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-
-        // Residual connection
-        let mut hidden = hidden_states.clone();
-
-        // Attention norm
-        let attn_norm_weight = tensors.get("input_layernorm.weight").ok_or_else(|| {
-            RiallmError::ModelLoading("Attention norm weight not found".to_string())
-        })?;
-
-        let normed = self.apply_rms_norm(&hidden, attn_norm_weight, self.config.rms_norm_eps)?;
-
-        // Self-attention
-        let q_weight = tensors
-            .get("self_attn.q_proj.weight")
-            .ok_or_else(|| RiallmError::ModelLoading("Q weight not found".to_string()))?;
-        let k_weight = tensors
-            .get("self_attn.k_proj.weight")
-            .ok_or_else(|| RiallmError::ModelLoading("K weight not found".to_string()))?;
-        let v_weight = tensors
-            .get("self_attn.v_proj.weight")
-            .ok_or_else(|| RiallmError::ModelLoading("V weight not found".to_string()))?;
-        let o_weight = tensors
-            .get("self_attn.o_proj.weight")
-            .ok_or_else(|| RiallmError::ModelLoading("O weight not found".to_string()))?;
-
-        // Create position IDs for this layer
-        let seq_len = normed.dim(D::Minus2)?;
-        let position_ids = self.create_position_ids(seq_len, hidden_states.device())?;
-
-        let (attn_output, _new_kv_cache) = self.apply_attention(
-            &normed,
-            q_weight,
-            k_weight,
-            v_weight,
-            o_weight,
-            None, // KV cache - TODO: integrate
-            Some(&position_ids),
-            attention_mask,
-            layer_idx,
-        )?;
-
-        // Add attention residual
-        hidden = hidden.add(&attn_output)?;
-
-        // Post-attention norm (if applicable)
-        if self.layer_names.use_post_attention_layernorm {
-            let ffn_norm_weight =
-                tensors
-                    .get("post_attention_layernorm.weight")
-                    .ok_or_else(|| {
-                        RiallmError::ModelLoading("FFN norm weight not found".to_string())
-                    })?;
-
-            hidden = self.apply_rms_norm(&hidden, ffn_norm_weight, self.config.rms_norm_eps)?;
-        }
-
-        // Feed-forward network
-        let gate_weight = tensors
-            .get("mlp.gate_proj.weight")
-            .ok_or_else(|| RiallmError::ModelLoading("Gate weight not found".to_string()))?;
-        let up_weight = tensors
-            .get("mlp.up_proj.weight")
-            .ok_or_else(|| RiallmError::ModelLoading("Up weight not found".to_string()))?;
-        let down_weight = tensors
-            .get("mlp.down_proj.weight")
-            .ok_or_else(|| RiallmError::ModelLoading("Down weight not found".to_string()))?;
-
-        let ffn_output = self.apply_mlp(&hidden, gate_weight, up_weight, down_weight)?;
-
-        // Add FFN residual
-        hidden = hidden.add(&ffn_output)?;
-
-        Ok(hidden)
     }
 
     /// Apply RMS normalization
@@ -455,7 +465,6 @@ impl AirLLMBaseModel {
         kv_cache: Option<(&Tensor, &Tensor)>,
         position_ids: Option<&Tensor>,
         attention_mask: Option<&Tensor>,
-        layer_idx: usize,
     ) -> Result<(Tensor, Option<(Tensor, Tensor)>)> {
         let (batch_size, seq_len, _) = hidden.dims3()?;
         let head_dim = self.config.hidden_size / self.config.num_attention_heads;
@@ -507,7 +516,7 @@ impl AirLLMBaseModel {
         // Apply attention mask (causal or provided)
         if let Some(mask) = attention_mask {
             attn_weights = attn_weights.add(mask)?;
-        } else if seq_len > 1 {
+        } else if seq_len > 1 || kv_cache.is_some() {
             // Apply causal mask for generation
             let causal_mask = self.create_causal_mask(seq_len, k_to_use.dim(2)?)?;
             if let Some(mask) = causal_mask {
@@ -623,9 +632,13 @@ impl AirLLMBaseModel {
         // Create lower triangular mask
         let mask_data: Vec<f32> = (0..seq_len)
             .flat_map(|i| {
-                (0..kv_seq_len)
-                    .map(|j| if j > i { f32::NEG_INFINITY } else { 0.0 })
-                    .collect::<Vec<_>>()
+                (0..kv_seq_len).map(move |j| {
+                    if j > i + (kv_seq_len - seq_len) {
+                        f32::NEG_INFINITY
+                    } else {
+                        0.0
+                    }
+                })
             })
             .collect();
 
@@ -634,8 +647,13 @@ impl AirLLMBaseModel {
     }
 
     /// Create position IDs tensor [seq_len]
-    fn create_position_ids(&self, seq_len: usize, device: &Device) -> Result<Tensor> {
-        let position_ids: Vec<u32> = (0..seq_len as u32).collect();
+    fn create_position_ids(
+        &self,
+        seq_len: usize,
+        offset: usize,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let position_ids: Vec<u32> = (offset as u32..(offset + seq_len) as u32).collect();
         Ok(Tensor::from_vec(position_ids, &[seq_len], device)?)
     }
 
@@ -765,17 +783,17 @@ impl AirLLMBaseModel {
         let mut tokens = input_ids.to_vec1::<u32>()?;
         let mut current_ids = input_ids.clone();
 
-        for _ in 0..max_new_tokens {
-            // Forward pass
-            let logits = self.forward(current_ids.clone().to_device(&self.cpu_device)?, None)?;
+        // Initial forward pass with full input
+        let mut logits = self.forward(current_ids.to_device(&self.cpu_device)?, None)?;
 
+        for _ in 0..max_new_tokens {
             // Get logits for last token
             let seq_len = logits.dim(D::Minus2)?;
-            let logits = logits.narrow(D::Minus2, seq_len - 1, 1)?;
-            let logits = logits.squeeze(0)?.squeeze(0)?;
+            let last_token_logits = logits.narrow(D::Minus2, seq_len - 1, 1)?;
+            let last_token_logits = last_token_logits.squeeze(0)?.squeeze(0)?;
 
-            // Simple argmax sampling (no randomness for now)
-            let logits_f32 = logits.to_vec1::<f32>()?;
+            // Simple argmax sampling
+            let logits_f32 = last_token_logits.to_vec1::<f32>()?;
             let next_token = logits_f32
                 .iter()
                 .enumerate()
@@ -785,8 +803,16 @@ impl AirLLMBaseModel {
 
             tokens.push(next_token);
 
-            // Prepare next input
-            current_ids = Tensor::new(&[next_token], &self.cpu_device)?;
+            // Update KV cache seq_len
+            if let Some(cache) = &mut self.kv_cache {
+                cache.seq_len += current_ids.dim(D::Minus1)?;
+            }
+
+            // Prepare next input (just the new token)
+            current_ids = Tensor::new(&[next_token], &self.cpu_device)?.reshape((1, 1))?;
+
+            // Forward pass for next token
+            logits = self.forward(current_ids.clone(), None)?;
         }
 
         Ok(tokens)
