@@ -170,6 +170,52 @@ impl ModelAdapter for Qwen2Adapter {
     }
 }
 
+/// Qwen3.5/Qwen3.6 MoE adapter
+pub struct Qwen35MoeAdapter {
+    config: ModelConfig,
+}
+
+impl Qwen35MoeAdapter {
+    pub fn new(config: ModelConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl ModelAdapter for Qwen35MoeAdapter {
+    fn get_layer_names(&self) -> LayerNames {
+        LayerNames::for_arch("qwen3_5_moe").unwrap()
+    }
+
+    fn prepare_position_ids(&self, input_ids: &Tensor) -> Result<Tensor> {
+        let seq_len = input_ids.dim(candle_core::D::Minus1)?;
+        let device = input_ids.device();
+        let position_ids: Vec<u32> = (0..seq_len as u32).collect();
+        Ok(Tensor::from_vec(position_ids, &[seq_len], device)?)
+    }
+
+    fn prepare_attention_mask_args(
+        &self,
+        attention_mask: Option<&Tensor>,
+        seq_len: usize,
+    ) -> Result<Option<Tensor>> {
+        let _ = seq_len;
+        Ok(attention_mask.cloned())
+    }
+
+    fn prepare_position_embedding_args(
+        &self,
+        position_ids: &Tensor,
+    ) -> Result<HashMap<String, Tensor>> {
+        let mut args = HashMap::new();
+        args.insert("position_ids".to_string(), position_ids.clone());
+        Ok(args)
+    }
+
+    fn model_type_name(&self) -> &str {
+        "qwen3_5_moe"
+    }
+}
+
 /// Mistral model adapter
 pub struct MistralAdapter {
     config: ModelConfig,
@@ -402,6 +448,11 @@ pub fn create_adapter(arch: &str, config: ModelConfig) -> Result<Box<dyn ModelAd
         "llama" | "llamaforcausallm" => Ok(Box::new(LlamaAdapter::new(config))),
         "qwen" | "qwenforcausallm" => Ok(Box::new(QwenAdapter::new(config))),
         "qwen2" | "qwen2forcausallm" => Ok(Box::new(Qwen2Adapter::new(config))),
+        "qwen3_5_moe"
+        | "qwen3_5_moe_text"
+        | "qwen3_5moe"
+        | "qwen3_5moeforconditionalgeneration"
+        | "qwen3_5_moeforconditionalgeneration" => Ok(Box::new(Qwen35MoeAdapter::new(config))),
         "mistral" | "mistralforcausallm" => Ok(Box::new(MistralAdapter::new(config))),
         "mixtral" | "mixtralforcausallm" => Ok(Box::new(MixtralAdapter::new(config))),
         "chatglm" | "chatglmforcausallm" => Ok(Box::new(ChatGLMAdapter::new(config))),

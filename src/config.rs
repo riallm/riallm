@@ -66,10 +66,78 @@ impl ModelConfig {
         }
 
         let config_str = std::fs::read_to_string(&config_file)?;
-        let mut config: ModelConfig = serde_json::from_str(&config_str)?;
-        config.model_path = model_path;
+        let value: serde_json::Value = serde_json::from_str(&config_str)?;
 
-        Ok(config)
+        Self::from_value(value, model_path)
+    }
+
+    /// Build a model configuration from a HuggingFace config.json value.
+    ///
+    /// Newer multimodal configs, including Qwen3.6, keep the decoder config in
+    /// `text_config`; older text-only configs keep the same fields at top level.
+    pub fn from_value(value: serde_json::Value, model_path: PathBuf) -> Result<Self> {
+        let model_type = value
+            .get("model_type")
+            .and_then(|val| val.as_str())
+            .map(ToString::to_string)
+            .or_else(|| {
+                Self::config_value(&value, "model_type")
+                    .and_then(|val| val.as_str())
+                    .map(ToString::to_string)
+            })
+            .ok_or_else(|| RiallmError::Config("Missing string field: model_type".to_string()))?;
+        let vocab_size = Self::usize_field(&value, "vocab_size")?;
+        let hidden_size = Self::usize_field(&value, "hidden_size")?;
+        let num_hidden_layers = Self::usize_field(&value, "num_hidden_layers")?;
+        let num_attention_heads = Self::usize_field(&value, "num_attention_heads")?;
+        let num_key_value_heads = Self::optional_usize_field(&value, "num_key_value_heads");
+        let intermediate_size = Self::usize_field_any(
+            &value,
+            &[
+                "intermediate_size",
+                "moe_intermediate_size",
+                "shared_expert_intermediate_size",
+            ],
+        )?;
+        let max_position_embeddings =
+            Self::usize_field_any(&value, &["max_position_embeddings", "seq_length"])?;
+        let rms_norm_eps = Self::f32_field_any(&value, &["rms_norm_eps", "layer_norm_epsilon"])?;
+        let rope_theta = Self::optional_f32_field(&value, "rope_theta").or_else(|| {
+            Self::config_value(&value, "rope_parameters")
+                .and_then(|rope| rope.get("rope_theta"))
+                .and_then(|theta| theta.as_f64())
+                .map(|theta| theta as f32)
+        });
+        let sliding_window = Self::optional_usize_field(&value, "sliding_window");
+
+        let mut extra = HashMap::new();
+        if let Some(root) = value.as_object() {
+            for (key, val) in root {
+                extra.insert(key.clone(), val.clone());
+            }
+        }
+        if let Some(text_config) = value.get("text_config").and_then(|v| v.as_object()) {
+            for (key, val) in text_config {
+                extra.entry(key.clone()).or_insert_with(|| val.clone());
+            }
+        }
+
+        Ok(Self {
+            model_type,
+            model_path,
+            split_path: None,
+            vocab_size,
+            hidden_size,
+            num_hidden_layers,
+            num_attention_heads,
+            num_key_value_heads,
+            intermediate_size,
+            max_position_embeddings,
+            rms_norm_eps,
+            rope_theta,
+            sliding_window,
+            extra,
+        })
     }
 
     /// Get the number of key-value heads (defaults to num_attention_heads)
@@ -81,6 +149,57 @@ impl ModelConfig {
     pub fn uses_gqa(&self) -> bool {
         self.num_key_value_heads.is_some()
             && self.num_key_value_heads.unwrap() != self.num_attention_heads
+    }
+
+    /// Whether this config is for Qwen3.5/Qwen3.6 MoE text decoder weights.
+    pub fn is_qwen3_5_moe(&self) -> bool {
+        self.model_type.to_lowercase().contains("qwen3_5_moe")
+    }
+
+    fn config_value<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+        value
+            .get("text_config")
+            .and_then(|text| text.get(key))
+            .or_else(|| value.get(key))
+    }
+
+    fn usize_field(value: &serde_json::Value, key: &str) -> Result<usize> {
+        Self::optional_usize_field(value, key)
+            .ok_or_else(|| RiallmError::Config(format!("Missing integer field: {}", key)))
+    }
+
+    fn usize_field_any(value: &serde_json::Value, keys: &[&str]) -> Result<usize> {
+        keys.iter()
+            .find_map(|key| Self::optional_usize_field(value, key))
+            .ok_or_else(|| {
+                RiallmError::Config(format!(
+                    "Missing integer field; expected one of: {}",
+                    keys.join(", ")
+                ))
+            })
+    }
+
+    fn optional_usize_field(value: &serde_json::Value, key: &str) -> Option<usize> {
+        Self::config_value(value, key)
+            .and_then(|val| val.as_u64())
+            .and_then(|val| usize::try_from(val).ok())
+    }
+
+    fn f32_field_any(value: &serde_json::Value, keys: &[&str]) -> Result<f32> {
+        keys.iter()
+            .find_map(|key| Self::optional_f32_field(value, key))
+            .ok_or_else(|| {
+                RiallmError::Config(format!(
+                    "Missing float field; expected one of: {}",
+                    keys.join(", ")
+                ))
+            })
+    }
+
+    fn optional_f32_field(value: &serde_json::Value, key: &str) -> Option<f32> {
+        Self::config_value(value, key)
+            .and_then(|val| val.as_f64())
+            .map(|val| val as f32)
     }
 }
 
@@ -133,6 +252,18 @@ impl LayerNames {
                 lm_head: "lm_head".to_string(),
                 use_post_attention_layernorm: false,
                 rotary_dim: None,
+            }),
+            "qwen3_5_moe"
+            | "qwen3_5moe"
+            | "qwen3_5_moe_text"
+            | "qwen3_5moeforconditionalgeneration"
+            | "qwen3_5_moeforconditionalgeneration" => Ok(Self {
+                embed: "model.language_model.embed_tokens".to_string(),
+                layer_prefix: "model.language_model.layers.".to_string(),
+                norm: "model.language_model.norm".to_string(),
+                lm_head: "lm_head".to_string(),
+                use_post_attention_layernorm: false,
+                rotary_dim: Some(64),
             }),
             "mistral" | "mistralforcausallm" => Ok(Self {
                 embed: "model.embed_tokens".to_string(),

@@ -87,6 +87,26 @@ let options = ModelOptions {
 let model = AutoModel::from_pretrained("model-path", Some(options)).await?;
 ```
 
+### Interactive Chat
+
+Native local chat for supported riallm decoder architectures:
+
+```bash
+cargo run --bin riallm -- chat --model /path/to/local/model --native --device cpu
+```
+
+Qwen3.6-35B-A3B uses the `qwen3_5_moe` architecture with linear-attention and MoE
+layers. riallm can parse its nested config and split/load its text weights, while
+interactive inference should use an OpenAI-compatible backend that has already
+loaded the model:
+
+```bash
+# Example: after starting vLLM/SGLang/Transformers on port 8000
+OPENAI_BASE_URL=http://127.0.0.1:8000/v1 \
+OPENAI_API_KEY=EMPTY \
+cargo run --bin riallm -- chat --model Qwen/Qwen3.6-35B-A3B --no-thinking
+```
+
 ## 🔧 Architecture
 
 ### Core Innovation
@@ -131,6 +151,7 @@ riallm/
 | **Llama** | Llama-2, Llama-3, Vicuna, Alpaca | ✅ |
 | **Qwen** | Qwen-7B, Qwen-14B | ✅ |
 | **Qwen2** | Qwen2-7B, Qwen2-72B | ✅ |
+| **Qwen3.6 MoE** | Qwen/Qwen3.6-35B-A3B metadata/splitting + interactive backend mode | ✅ |
 | **Mistral** | Mistral-7B | ✅ |
 | **Mixtral** | Mixtral-8x7B (MoE) | ✅ |
 | **ChatGLM** | ChatGLM2, ChatGLM3 | ✅ |

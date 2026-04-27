@@ -13,6 +13,7 @@ pub enum ModelArchitecture {
     Llama,
     Qwen,
     Qwen2,
+    Qwen35Moe,
     Mistral,
     Mixtral,
     ChatGLM,
@@ -28,6 +29,8 @@ impl ModelArchitecture {
 
         if arch.contains("llama") {
             ModelArchitecture::Llama
+        } else if arch.contains("qwen3_5_moe") {
+            ModelArchitecture::Qwen35Moe
         } else if arch.contains("qwen2") {
             ModelArchitecture::Qwen2
         } else if arch.contains("qwen") {
@@ -53,6 +56,7 @@ impl ModelArchitecture {
             ModelArchitecture::Llama => "llama",
             ModelArchitecture::Qwen => "qwen",
             ModelArchitecture::Qwen2 => "qwen2",
+            ModelArchitecture::Qwen35Moe => "qwen3_5_moe",
             ModelArchitecture::Mistral => "mistral",
             ModelArchitecture::Mixtral => "mixtral",
             ModelArchitecture::ChatGLM => "chatglm",
@@ -135,7 +139,9 @@ impl AutoModel {
 
         let arch = &architectures[0];
 
-        if arch.contains("Llama") || arch.contains("Mistral") {
+        if arch.contains("Qwen3_5Moe") || arch.contains("Qwen3_5_Moe") {
+            Ok(ModelArchitecture::Qwen35Moe)
+        } else if arch.contains("Llama") || arch.contains("Mistral") {
             Ok(ModelArchitecture::Llama)
         } else if arch.contains("Qwen2") {
             Ok(ModelArchitecture::Qwen2)

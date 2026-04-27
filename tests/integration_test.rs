@@ -35,6 +35,17 @@ mod tests {
     }
 
     #[test]
+    fn test_layer_names_qwen3_5_moe() {
+        let layer_names = LayerNames::for_arch("qwen3_5_moe").unwrap();
+
+        assert_eq!(layer_names.embed, "model.language_model.embed_tokens");
+        assert_eq!(layer_names.layer_prefix, "model.language_model.layers.");
+        assert_eq!(layer_names.norm, "model.language_model.norm");
+        assert_eq!(layer_names.lm_head, "lm_head");
+        assert_eq!(layer_names.rotary_dim, Some(64));
+    }
+
+    #[test]
     fn test_layer_names_mistral() {
         let layer_names = LayerNames::for_arch("mistral").unwrap();
 
@@ -75,6 +86,39 @@ mod tests {
         assert!(options.prefetch_layers);
         assert!(!options.profiling_mode);
         assert_eq!(options.dtype, "float16");
+    }
+
+    #[test]
+    fn test_qwen3_5_moe_nested_config_parse() {
+        let config_value = serde_json::json!({
+            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+            "model_type": "qwen3_5_moe",
+            "text_config": {
+                "hidden_size": 2048,
+                "vocab_size": 248320,
+                "num_hidden_layers": 40,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 2,
+                "moe_intermediate_size": 512,
+                "max_position_embeddings": 262144,
+                "rms_norm_eps": 1e-6,
+                "rope_parameters": {
+                    "rope_theta": 10000000
+                }
+            }
+        });
+
+        let config = ModelConfig::from_value(config_value, PathBuf::from("/tmp/qwen3")).unwrap();
+
+        assert_eq!(config.model_type, "qwen3_5_moe");
+        assert_eq!(config.hidden_size, 2048);
+        assert_eq!(config.vocab_size, 248320);
+        assert_eq!(config.num_hidden_layers, 40);
+        assert_eq!(config.num_key_value_heads, Some(2));
+        assert_eq!(config.intermediate_size, 512);
+        assert_eq!(config.max_position_embeddings, 262144);
+        assert_eq!(config.rope_theta, Some(10000000.0));
+        assert!(config.is_qwen3_5_moe());
     }
 
     #[test]

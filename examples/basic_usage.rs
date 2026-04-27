@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Load model
     println!("\nLoading model...");
-    let mut model = AutoModel::from_pretrained(&model_path, Some(options)).await?;
+    let model = AutoModel::from_pretrained(&model_path, Some(options)).await?;
 
     // Example 2: Generate text
     println!("\n{}", "=".repeat(60));
@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
     
     // Decode output
     let output_text = tokenizer.decode(&output_tokens, true)?;
-    println!(\"Generated: {}\", output_text);
+    println!(\"Generated: {{}}\", output_text);
     "
     );
 

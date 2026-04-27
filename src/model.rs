@@ -219,6 +219,16 @@ impl AirLLMBaseModel {
         hidden_states: Tensor,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
+        if self.config.is_qwen3_5_moe() {
+            return Err(RiallmError::ModelLoading(
+                "Native forward for qwen3_5_moe/Qwen3.6 is not implemented yet. \
+                 riallm can parse, split, and load the model metadata/weights; use the \
+                 interactive OpenAI-compatible chat mode with a loaded vLLM/SGLang/Transformers \
+                 backend for Qwen3.6 inference."
+                    .to_string(),
+            ));
+        }
+
         let mut current_hidden = hidden_states.to_device(&self.cpu_device)?;
 
         // Track which layer is currently on GPU
@@ -495,7 +505,8 @@ impl AirLLMBaseModel {
         // Apply RoPE (rotary position embeddings)
         if let Some(pos_ids) = position_ids {
             let rope_theta = self.config.rope_theta.unwrap_or(10000.0);
-            (q, k) = self.apply_rope(&q, &k, pos_ids, head_dim, rope_theta)?;
+            let rope_dim = self.layer_names.rotary_dim.unwrap_or(head_dim);
+            (q, k) = self.apply_rope(&q, &k, pos_ids, rope_dim, rope_theta)?;
         }
 
         // Handle KV cache
@@ -548,11 +559,9 @@ impl AirLLMBaseModel {
         q: &Tensor,
         k: &Tensor,
         position_ids: &Tensor,
-        head_dim: usize,
+        rope_dim: usize,
         rope_theta: f32,
     ) -> Result<(Tensor, Tensor)> {
-        let rope_dim = head_dim; // Use full head dim for RoPE
-
         // Create inverse frequency tensor
         let inv_freq: Vec<f32> = (0..rope_dim)
             .step_by(2)
@@ -596,25 +605,18 @@ impl AirLLMBaseModel {
         sin: &Tensor,
         rope_dim: usize,
     ) -> Result<Tensor> {
-        // Split x into two halves for rotation
         let x_shape = x.shape();
         let dims = x_shape.dims();
         let head_dim = dims[3];
+        let half = rope_dim / 2;
 
-        // Split x into x1 and x2 (each half of the rope_dim)
-        let x1 = x.narrow(3, 0, rope_dim / 2)?;
-        let x2 = x.narrow(3, rope_dim / 2, rope_dim / 2)?;
+        let x1 = x.narrow(3, 0, half)?;
+        let x2 = x.narrow(3, half, half)?;
 
-        // rotate_half: [-x2, x1]
-        let neg_x2 = x2.neg()?;
-        let rotated = Tensor::cat(&[&neg_x2, &x1], 3)?;
+        let out1 = x1.mul(cos)?.add(&x2.mul(sin)?.neg()?)?;
+        let out2 = x2.mul(cos)?.add(&x1.mul(sin)?)?;
+        let result = Tensor::cat(&[&out1, &out2], 3)?;
 
-        // x * cos + rotated * sin
-        let x_cos = x.narrow(3, 0, rope_dim)?.mul(cos)?;
-        let rotated_sin = rotated.mul(sin)?;
-        let result = x_cos.add(&rotated_sin)?;
-
-        // If rope_dim < head_dim, concatenate the unchanged part
         if rope_dim < head_dim {
             let unchanged = x.narrow(3, rope_dim, head_dim - rope_dim)?;
             Ok(Tensor::cat(&[&result, &unchanged], 3)?)
@@ -777,10 +779,10 @@ impl AirLLMBaseModel {
         &mut self,
         input_ids: &Tensor,
         max_new_tokens: usize,
-        temperature: f64,
+        _temperature: f64,
         _top_p: Option<f64>,
     ) -> Result<Vec<u32>> {
-        let mut tokens = input_ids.to_vec1::<u32>()?;
+        let mut tokens = input_ids.flatten_all()?.to_vec1::<u32>()?;
         let mut current_ids = input_ids.clone();
 
         // Initial forward pass with full input
@@ -816,6 +818,11 @@ impl AirLLMBaseModel {
         }
 
         Ok(tokens)
+    }
+
+    /// Reset cached key/value tensors before starting a fresh prompt.
+    pub fn reset_kv_cache(&mut self) {
+        self.kv_cache = Some(KVCACHE::new(self.config.num_hidden_layers));
     }
 
     /// Get the profiler for inspection
