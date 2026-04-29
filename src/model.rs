@@ -219,16 +219,6 @@ impl AirLLMBaseModel {
         hidden_states: Tensor,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        if self.config.is_qwen3_5_moe() {
-            return Err(RiallmError::ModelLoading(
-                "Native forward for qwen3_5_moe/Qwen3.6 is not implemented yet. \
-                 riallm can parse, split, and load the model metadata/weights; use the \
-                 interactive OpenAI-compatible chat mode with a loaded vLLM/SGLang/Transformers \
-                 backend for Qwen3.6 inference."
-                    .to_string(),
-            ));
-        }
-
         let mut current_hidden = hidden_states.to_device(&self.cpu_device)?;
 
         // Track which layer is currently on GPU
@@ -320,7 +310,11 @@ impl AirLLMBaseModel {
                     RiallmError::ModelLoading("Final norm weight not found".to_string())
                 })?;
 
-                self.apply_rms_norm(hidden_states, weight, self.config.rms_norm_eps)
+                if self.config.is_qwen3_5_moe() {
+                    self.apply_rms_norm_one_plus(hidden_states, weight, self.config.rms_norm_eps)
+                } else {
+                    self.apply_rms_norm(hidden_states, weight, self.config.rms_norm_eps)
+                }
             }
 
             "lm_head" => {
@@ -349,6 +343,15 @@ impl AirLLMBaseModel {
                     .unwrap_or(0);
 
                 let tensors = &layer_state.tensors;
+
+                if self.config.is_qwen3_5_moe() {
+                    return self.forward_qwen3_5_layer(
+                        layer_idx,
+                        tensors,
+                        hidden_states,
+                        attention_mask,
+                    );
+                }
 
                 // Residual connection
                 let mut hidden = hidden_states.clone();
@@ -462,6 +465,448 @@ impl AirLLMBaseModel {
 
         // Convert back to original dtype
         Ok(weighted.to_dtype(hidden.dtype())?)
+    }
+
+    /// Qwen3.5/Qwen3.6 stores RMSNorm weights as an offset from 1.0.
+    fn apply_rms_norm_one_plus(
+        &self,
+        hidden: &Tensor,
+        weight: &Tensor,
+        eps: f32,
+    ) -> Result<Tensor> {
+        let hidden_f32 = hidden.to_dtype(candle_core::DType::F32)?;
+        let variance = hidden_f32.sqr()?.sum_keepdim(D::Minus1)?;
+        let hidden_size = hidden.dim(D::Minus1)? as f64;
+        let variance = (variance / hidden_size)?;
+        let eps_tensor = Tensor::full(eps as f32, variance.shape(), variance.device())?;
+        let rsqrt = variance.add(&eps_tensor)?.sqrt()?.recip()?;
+        let normalized = hidden_f32.broadcast_mul(&rsqrt)?;
+        let weight = weight.to_dtype(candle_core::DType::F32)?;
+        let weight = weight.ones_like()?.add(&weight)?;
+        let weighted = normalized.broadcast_mul(&weight)?;
+
+        Ok(weighted.to_dtype(hidden.dtype())?)
+    }
+
+    fn forward_qwen3_5_layer(
+        &self,
+        layer_idx: usize,
+        tensors: &HashMap<String, Tensor>,
+        hidden_states: &Tensor,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let residual = hidden_states;
+        let input_norm = self.apply_rms_norm_one_plus(
+            hidden_states,
+            get_tensor(tensors, "input_layernorm.weight")?,
+            self.config.rms_norm_eps,
+        )?;
+
+        let mixed = match self.qwen3_5_layer_type(layer_idx).as_str() {
+            "linear_attention" => {
+                self.apply_qwen3_5_gated_delta_net(tensors, &input_norm, attention_mask)?
+            }
+            "full_attention" => self.apply_qwen3_5_full_attention(tensors, &input_norm)?,
+            layer_type => {
+                return Err(RiallmError::ModelLoading(format!(
+                    "Unsupported Qwen3.6 layer type at layer {}: {}",
+                    layer_idx, layer_type
+                )));
+            }
+        };
+
+        let hidden = residual.add(&mixed)?;
+        let residual = hidden.clone();
+        let ffn_norm = self.apply_rms_norm_one_plus(
+            &hidden,
+            get_tensor(tensors, "post_attention_layernorm.weight")?,
+            self.config.rms_norm_eps,
+        )?;
+        let ffn_output = self.apply_qwen3_5_moe(tensors, &ffn_norm)?;
+
+        residual.add(&ffn_output).map_err(Into::into)
+    }
+
+    fn apply_qwen3_5_full_attention(
+        &self,
+        tensors: &HashMap<String, Tensor>,
+        hidden: &Tensor,
+    ) -> Result<Tensor> {
+        let (batch_size, seq_len, _) = hidden.dims3()?;
+        let num_heads = self.config.num_attention_heads;
+        let num_kv_heads = self.config.get_num_key_value_heads();
+        let num_kv_groups = num_heads / num_kv_heads;
+        let head_dim = self.qwen3_5_usize("head_dim", self.config.hidden_size / num_heads);
+        let attn_dim = num_heads * head_dim;
+
+        let q_proj = hidden.matmul(&get_tensor(tensors, "self_attn.q_proj.weight")?.t()?)?;
+        let q_proj = q_proj.reshape((batch_size, seq_len, num_heads, head_dim * 2))?;
+        let q_chunks = q_proj.chunk(2, D::Minus1)?;
+        let query = self
+            .apply_rms_norm_one_plus(
+                &q_chunks[0],
+                get_tensor(tensors, "self_attn.q_norm.weight")?,
+                self.config.rms_norm_eps,
+            )?
+            .transpose(1, 2)?;
+        let gate = q_chunks[1].reshape((batch_size, seq_len, attn_dim))?;
+
+        let key = hidden
+            .matmul(&get_tensor(tensors, "self_attn.k_proj.weight")?.t()?)?
+            .reshape((batch_size, seq_len, num_kv_heads, head_dim))?;
+        let key = self
+            .apply_rms_norm_one_plus(
+                &key,
+                get_tensor(tensors, "self_attn.k_norm.weight")?,
+                self.config.rms_norm_eps,
+            )?
+            .transpose(1, 2)?;
+        let value = hidden
+            .matmul(&get_tensor(tensors, "self_attn.v_proj.weight")?.t()?)?
+            .reshape((batch_size, seq_len, num_kv_heads, head_dim))?
+            .transpose(1, 2)?;
+
+        let position_ids = self.create_position_ids(seq_len, 0, hidden.device())?;
+        let (query, key) = self.apply_rope(
+            &query,
+            &key,
+            &position_ids,
+            self.layer_names.rotary_dim.unwrap_or(head_dim),
+            self.config.rope_theta.unwrap_or(10000.0),
+        )?;
+
+        let key = repeat_heads(&key, num_kv_groups)?;
+        let value = repeat_heads(&value, num_kv_groups)?;
+
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let mut attn_weights = (query.matmul(&key.t()?)? * scale)?;
+        let mask = self.create_full_causal_mask(seq_len, hidden.device(), attn_weights.dtype())?;
+        attn_weights = attn_weights.add(&mask)?;
+        let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
+        let attn_output = attn_weights
+            .matmul(&value)?
+            .transpose(1, 2)?
+            .reshape((batch_size, seq_len, attn_dim))?;
+        let attn_output = attn_output.mul(&candle_nn::ops::sigmoid(&gate)?)?;
+
+        attn_output
+            .matmul(&get_tensor(tensors, "self_attn.o_proj.weight")?.t()?)
+            .map_err(Into::into)
+    }
+
+    fn apply_qwen3_5_gated_delta_net(
+        &self,
+        tensors: &HashMap<String, Tensor>,
+        hidden: &Tensor,
+        _attention_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (batch_size, seq_len, _) = hidden.dims3()?;
+        let num_v_heads = self.qwen3_5_usize("linear_num_value_heads", 32);
+        let num_k_heads = self.qwen3_5_usize("linear_num_key_heads", 16);
+        let head_k_dim = self.qwen3_5_usize("linear_key_head_dim", 128);
+        let head_v_dim = self.qwen3_5_usize("linear_value_head_dim", 128);
+        let key_dim = num_k_heads * head_k_dim;
+        let value_dim = num_v_heads * head_v_dim;
+
+        let mixed_qkv = hidden
+            .matmul(&get_tensor(tensors, "linear_attn.in_proj_qkv.weight")?.t()?)?
+            .transpose(1, 2)?;
+        let mixed_qkv = self.depthwise_causal_conv1d(
+            &mixed_qkv,
+            get_tensor(tensors, "linear_attn.conv1d.weight")?,
+        )?;
+        let mixed_qkv = mixed_qkv.transpose(1, 2)?;
+
+        let query = mixed_qkv.narrow(D::Minus1, 0, key_dim)?.reshape((
+            batch_size,
+            seq_len,
+            num_k_heads,
+            head_k_dim,
+        ))?;
+        let key = mixed_qkv.narrow(D::Minus1, key_dim, key_dim)?.reshape((
+            batch_size,
+            seq_len,
+            num_k_heads,
+            head_k_dim,
+        ))?;
+        let value = mixed_qkv
+            .narrow(D::Minus1, key_dim * 2, value_dim)?
+            .reshape((batch_size, seq_len, num_v_heads, head_v_dim))?;
+
+        let z = hidden
+            .matmul(&get_tensor(tensors, "linear_attn.in_proj_z.weight")?.t()?)?
+            .reshape((batch_size, seq_len, num_v_heads, head_v_dim))?;
+        let beta = candle_nn::ops::sigmoid(
+            &hidden.matmul(&get_tensor(tensors, "linear_attn.in_proj_b.weight")?.t()?)?,
+        )?;
+        let a = hidden.matmul(&get_tensor(tensors, "linear_attn.in_proj_a.weight")?.t()?)?;
+        let dt_bias = get_tensor(tensors, "linear_attn.dt_bias")?
+            .to_dtype(candle_core::DType::F32)?
+            .reshape((1, 1, num_v_heads))?;
+        let a = a
+            .to_dtype(candle_core::DType::F32)?
+            .broadcast_add(&dt_bias)?;
+        let g = softplus(&a)?
+            .broadcast_mul(
+                &get_tensor(tensors, "linear_attn.A_log")?
+                    .to_dtype(candle_core::DType::F32)?
+                    .exp()?
+                    .reshape((1, 1, num_v_heads))?,
+            )?
+            .neg()?;
+
+        let repeat = num_v_heads / num_k_heads;
+        let query = if repeat > 1 {
+            repeat_linear_heads(&query, repeat)?
+        } else {
+            query
+        };
+        let key = if repeat > 1 {
+            repeat_linear_heads(&key, repeat)?
+        } else {
+            key
+        };
+
+        let core = self.torch_recurrent_gated_delta_rule(&query, &key, &value, &g, &beta)?;
+        let core = core.reshape((batch_size * seq_len * num_v_heads, head_v_dim))?;
+        let z = z.reshape((batch_size * seq_len * num_v_heads, head_v_dim))?;
+        let core = self.apply_qwen3_5_gated_rms_norm(
+            &core,
+            &z,
+            get_tensor(tensors, "linear_attn.norm.weight")?,
+        )?;
+        let core = core.reshape((batch_size, seq_len, value_dim))?;
+
+        core.matmul(&get_tensor(tensors, "linear_attn.out_proj.weight")?.t()?)
+            .map_err(Into::into)
+    }
+
+    fn apply_qwen3_5_gated_rms_norm(
+        &self,
+        hidden: &Tensor,
+        gate: &Tensor,
+        weight: &Tensor,
+    ) -> Result<Tensor> {
+        let normed = self.apply_rms_norm(hidden, weight, self.config.rms_norm_eps)?;
+        normed
+            .mul(
+                &candle_nn::ops::silu(&gate.to_dtype(candle_core::DType::F32)?)?
+                    .to_dtype(normed.dtype())?,
+            )
+            .map_err(Into::into)
+    }
+
+    fn torch_recurrent_gated_delta_rule(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        g: &Tensor,
+        beta: &Tensor,
+    ) -> Result<Tensor> {
+        let (batch_size, seq_len, num_heads, head_k_dim) = query.dims4()?;
+        let head_v_dim = value.dim(D::Minus1)?;
+        let output_dtype = value.dtype();
+        let query = l2norm(query, D::Minus1, 1e-6)?.to_dtype(candle_core::DType::F32)?;
+        let key = l2norm(key, D::Minus1, 1e-6)?.to_dtype(candle_core::DType::F32)?;
+        let value = value.to_dtype(candle_core::DType::F32)?;
+        let beta = beta.to_dtype(candle_core::DType::F32)?;
+        let g = g.to_dtype(candle_core::DType::F32)?;
+        let query = (query * (1.0 / (head_k_dim as f64).sqrt()))?;
+
+        let mut state = Tensor::zeros(
+            (batch_size, num_heads, head_k_dim, head_v_dim),
+            candle_core::DType::F32,
+            query.device(),
+        )?;
+        let mut outputs = Vec::with_capacity(seq_len);
+
+        for index in 0..seq_len {
+            let q_t = query.narrow(1, index, 1)?.squeeze(1)?;
+            let k_t = key.narrow(1, index, 1)?.squeeze(1)?;
+            let v_t = value.narrow(1, index, 1)?.squeeze(1)?;
+            let g_t = g.narrow(1, index, 1)?.squeeze(1)?.exp()?;
+            let beta_t = beta.narrow(1, index, 1)?.squeeze(1)?;
+
+            state = state.broadcast_mul(&g_t.reshape((batch_size, num_heads, 1, 1))?)?;
+            let kv_mem = state
+                .broadcast_mul(&k_t.reshape((batch_size, num_heads, head_k_dim, 1))?)?
+                .sum(D::Minus2)?;
+            let delta = v_t
+                .add(&kv_mem.neg()?)?
+                .broadcast_mul(&beta_t.reshape((batch_size, num_heads, 1))?)?;
+            let update = k_t
+                .reshape((batch_size, num_heads, head_k_dim, 1))?
+                .broadcast_mul(&delta.reshape((batch_size, num_heads, 1, head_v_dim))?)?;
+            state = state.add(&update)?;
+            let out = state
+                .broadcast_mul(&q_t.reshape((batch_size, num_heads, head_k_dim, 1))?)?
+                .sum(D::Minus2)?;
+            outputs.push(out);
+        }
+
+        Ok(Tensor::stack(&outputs, 1)?.to_dtype(output_dtype)?)
+    }
+
+    fn apply_qwen3_5_moe(
+        &self,
+        tensors: &HashMap<String, Tensor>,
+        hidden: &Tensor,
+    ) -> Result<Tensor> {
+        let (batch_size, seq_len, hidden_dim) = hidden.dims3()?;
+        let flat = hidden.reshape((batch_size * seq_len, hidden_dim))?;
+        let top_k = self.qwen3_5_usize("num_experts_per_tok", 8);
+        let num_experts = self.qwen3_5_usize("num_experts", 256);
+
+        let shared = self.apply_qwen3_5_shared_expert(tensors, &flat)?;
+        let router_logits = flat.matmul(&get_tensor(tensors, "mlp.gate.weight")?.t()?)?;
+        let routing_probs = candle_nn::ops::softmax(&router_logits, D::Minus1)?;
+        let selected_experts = routing_probs
+            .arg_sort_last_dim(false)?
+            .narrow(D::Minus1, 0, top_k)?
+            .contiguous()?;
+        let routing_weights = routing_probs.gather(&selected_experts, D::Minus1)?;
+        let routing_weights =
+            routing_weights.broadcast_div(&routing_weights.sum_keepdim(D::Minus1)?)?;
+
+        let routing_weights_vec = routing_weights
+            .to_dtype(candle_core::DType::F32)?
+            .to_vec2::<f32>()?;
+        let selected_experts_vec = selected_experts.to_vec2::<u32>()?;
+        let mut token_indices = vec![Vec::new(); num_experts];
+        let mut token_weights = vec![Vec::new(); num_experts];
+
+        for (row_idx, (weights, experts)) in routing_weights_vec
+            .iter()
+            .zip(selected_experts_vec.iter())
+            .enumerate()
+        {
+            for (&weight, &expert_idx) in weights.iter().zip(experts.iter()) {
+                let expert_idx = expert_idx as usize;
+                token_indices[expert_idx].push(row_idx as u32);
+                token_weights[expert_idx].push(weight);
+            }
+        }
+
+        let gate_up_proj = get_tensor(tensors, "mlp.experts.gate_up_proj")?;
+        let down_proj = get_tensor(tensors, "mlp.experts.down_proj")?;
+        let mut output = flat.zeros_like()?;
+        for expert_idx in 0..num_experts {
+            if token_indices[expert_idx].is_empty() {
+                continue;
+            }
+
+            let indices = Tensor::new(token_indices[expert_idx].as_slice(), flat.device())?;
+            let weights = Tensor::new(token_weights[expert_idx].as_slice(), flat.device())?
+                .reshape(((), 1))?
+                .to_dtype(flat.dtype())?;
+            let current = flat.index_select(&indices, 0)?;
+            let gate_up = gate_up_proj.narrow(0, expert_idx, 1)?.squeeze(0)?;
+            let projected = current.matmul(&gate_up.t()?)?;
+            let chunks = projected.chunk(2, D::Minus1)?;
+            let expert_hidden = candle_nn::ops::silu(&chunks[0])?.mul(&chunks[1])?;
+            let down = down_proj.narrow(0, expert_idx, 1)?.squeeze(0)?;
+            let expert_hidden = expert_hidden.matmul(&down.t()?)?;
+            let expert_hidden = expert_hidden.broadcast_mul(&weights)?;
+            output = output.index_add(&indices, &expert_hidden, 0)?;
+        }
+
+        output
+            .add(&shared)?
+            .reshape((batch_size, seq_len, hidden_dim))
+            .map_err(Into::into)
+    }
+
+    fn apply_qwen3_5_shared_expert(
+        &self,
+        tensors: &HashMap<String, Tensor>,
+        flat: &Tensor,
+    ) -> Result<Tensor> {
+        let gate = flat.matmul(&get_tensor(tensors, "mlp.shared_expert.gate_proj.weight")?.t()?)?;
+        let up = flat.matmul(&get_tensor(tensors, "mlp.shared_expert.up_proj.weight")?.t()?)?;
+        let shared = candle_nn::ops::silu(&gate)?
+            .mul(&up)?
+            .matmul(&get_tensor(tensors, "mlp.shared_expert.down_proj.weight")?.t()?)?;
+        let shared_gate = candle_nn::ops::sigmoid(
+            &flat.matmul(&get_tensor(tensors, "mlp.shared_expert_gate.weight")?.t()?)?,
+        )?;
+        shared.broadcast_mul(&shared_gate).map_err(Into::into)
+    }
+
+    fn depthwise_causal_conv1d(&self, xs: &Tensor, weight: &Tensor) -> Result<Tensor> {
+        let (batch_size, channels, seq_len) = xs.dims3()?;
+        let weight = if weight.dims().len() == 3 {
+            weight.squeeze(1)?
+        } else {
+            weight.clone()
+        };
+        let kernel = weight.dim(D::Minus1)?;
+        let mut outputs = Vec::with_capacity(seq_len);
+
+        for out_index in 0..seq_len {
+            let mut acc = Tensor::zeros(
+                (batch_size, channels, 1),
+                candle_core::DType::F32,
+                xs.device(),
+            )?;
+            for kernel_index in 0..kernel {
+                let input_index = out_index as isize + kernel_index as isize + 1 - kernel as isize;
+                if input_index < 0 || input_index >= seq_len as isize {
+                    continue;
+                }
+                let input = xs
+                    .narrow(2, input_index as usize, 1)?
+                    .to_dtype(candle_core::DType::F32)?;
+                let kernel_weight = weight
+                    .narrow(D::Minus1, kernel_index, 1)?
+                    .reshape((1, channels, 1))?
+                    .to_dtype(candle_core::DType::F32)?;
+                acc = acc.add(&input.broadcast_mul(&kernel_weight)?)?;
+            }
+            outputs.push(candle_nn::ops::silu(&acc)?.to_dtype(xs.dtype())?);
+        }
+
+        Ok(Tensor::cat(&outputs.iter().collect::<Vec<_>>(), 2)?)
+    }
+
+    fn create_full_causal_mask(
+        &self,
+        seq_len: usize,
+        device: &Device,
+        dtype: candle_core::DType,
+    ) -> Result<Tensor> {
+        let mask_data: Vec<f32> = (0..seq_len)
+            .flat_map(|i| (0..seq_len).map(move |j| if j > i { f32::NEG_INFINITY } else { 0.0 }))
+            .collect();
+
+        Ok(Tensor::from_vec(mask_data, &[1, 1, seq_len, seq_len], device)?.to_dtype(dtype)?)
+    }
+
+    fn qwen3_5_usize(&self, key: &str, default: usize) -> usize {
+        self.config
+            .extra
+            .get(key)
+            .and_then(|value| value.as_u64())
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(default)
+    }
+
+    fn qwen3_5_layer_type(&self, layer_idx: usize) -> String {
+        self.config
+            .extra
+            .get("layer_types")
+            .and_then(|value| value.as_array())
+            .and_then(|layers| layers.get(layer_idx))
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                let interval = self.qwen3_5_usize("full_attention_interval", 4);
+                if (layer_idx + 1) % interval == 0 {
+                    "full_attention".to_string()
+                } else {
+                    "linear_attention".to_string()
+                }
+            })
     }
 
     /// Apply self-attention
@@ -782,6 +1227,10 @@ impl AirLLMBaseModel {
         _temperature: f64,
         _top_p: Option<f64>,
     ) -> Result<Vec<u32>> {
+        if self.config.is_qwen3_5_moe() {
+            return self.generate_full_context(input_ids, max_new_tokens);
+        }
+
         let mut tokens = input_ids.flatten_all()?.to_vec1::<u32>()?;
         let mut current_ids = input_ids.clone();
 
@@ -820,6 +1269,34 @@ impl AirLLMBaseModel {
         Ok(tokens)
     }
 
+    fn generate_full_context(
+        &mut self,
+        input_ids: &Tensor,
+        max_new_tokens: usize,
+    ) -> Result<Vec<u32>> {
+        let mut tokens = input_ids.flatten_all()?.to_vec1::<u32>()?;
+
+        for _ in 0..max_new_tokens {
+            self.reset_kv_cache();
+            let current_ids =
+                Tensor::new(tokens.as_slice(), &self.cpu_device)?.reshape((1, tokens.len()))?;
+            let logits = self.forward(current_ids, None)?;
+            let seq_len = logits.dim(D::Minus2)?;
+            let last_token_logits = logits.narrow(D::Minus2, seq_len - 1, 1)?;
+            let last_token_logits = last_token_logits.squeeze(0)?.squeeze(0)?;
+            let logits_f32 = last_token_logits.to_vec1::<f32>()?;
+            let next_token = logits_f32
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+            tokens.push(next_token);
+        }
+
+        Ok(tokens)
+    }
+
     /// Reset cached key/value tensors before starting a fresh prompt.
     pub fn reset_kv_cache(&mut self) {
         self.kv_cache = Some(KVCACHE::new(self.config.num_hidden_layers));
@@ -829,4 +1306,49 @@ impl AirLLMBaseModel {
     pub fn profiler(&self) -> Option<&Profiler> {
         self.profiler.as_ref()
     }
+}
+
+fn get_tensor<'a>(tensors: &'a HashMap<String, Tensor>, name: &str) -> Result<&'a Tensor> {
+    tensors
+        .get(name)
+        .ok_or_else(|| RiallmError::ModelLoading(format!("Tensor not found: {}", name)))
+}
+
+fn repeat_heads(hidden_states: &Tensor, repeats: usize) -> Result<Tensor> {
+    if repeats == 1 {
+        return Ok(hidden_states.clone());
+    }
+
+    let (batch_size, heads, seq_len, head_dim) = hidden_states.dims4()?;
+    hidden_states
+        .reshape((batch_size, heads, 1, seq_len, head_dim))?
+        .broadcast_as((batch_size, heads, repeats, seq_len, head_dim))?
+        .reshape((batch_size, heads * repeats, seq_len, head_dim))
+        .map_err(Into::into)
+}
+
+fn repeat_linear_heads(hidden_states: &Tensor, repeats: usize) -> Result<Tensor> {
+    if repeats == 1 {
+        return Ok(hidden_states.clone());
+    }
+
+    let (batch_size, seq_len, heads, head_dim) = hidden_states.dims4()?;
+    hidden_states
+        .reshape((batch_size, seq_len, heads, 1, head_dim))?
+        .broadcast_as((batch_size, seq_len, heads, repeats, head_dim))?
+        .reshape((batch_size, seq_len, heads * repeats, head_dim))
+        .map_err(Into::into)
+}
+
+fn l2norm(x: &Tensor, dim: D, eps: f32) -> Result<Tensor> {
+    let x_f32 = x.to_dtype(candle_core::DType::F32)?;
+    let norm = x_f32.sqr()?.sum_keepdim(dim)?;
+    let eps = Tensor::full(eps, norm.shape(), norm.device())?;
+    x_f32
+        .broadcast_mul(&norm.add(&eps)?.sqrt()?.recip()?)
+        .map_err(Into::into)
+}
+
+fn softplus(x: &Tensor) -> Result<Tensor> {
+    x.exp()?.add(&x.ones_like()?)?.log().map_err(Into::into)
 }

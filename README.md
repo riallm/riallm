@@ -10,7 +10,7 @@
 
 - **Memory Optimization**: Load only one layer at a time into GPU memory
 - **Large Model Support**: Run 70B parameter models on 4GB GPU memory
-- **Multiple Architectures**: Support for Llama, Qwen, Mistral, Mixtral, ChatGLM, Baichuan, InternLM
+- **Multiple Architectures**: Support for Llama, Qwen, Qwen3.6 MoE, Mistral, Mixtral, ChatGLM, Baichuan, InternLM
 - **Quantization**: 4-bit NF4 and 8-bit block-wise quantization
 - **High Performance**: Built on HuggingFace's Candle framework
 - **Safety**: Rust's memory safety guarantees for reliable production use
@@ -89,23 +89,44 @@ let model = AutoModel::from_pretrained("model-path", Some(options)).await?;
 
 ### Interactive Chat
 
-Native local chat for supported riallm decoder architectures:
+Interactive chat runs directly inside riallm against a local Hugging Face model
+directory. It does not require an OpenAI-compatible server, vLLM, SGLang, or any
+other backend process.
 
 ```bash
-cargo run --bin riallm -- chat --model /path/to/local/model --native --device cpu
+cargo run --bin riallm -- chat \
+  --model /path/to/local/model \
+  --device cpu
 ```
 
-Qwen3.6-35B-A3B uses the `qwen3_5_moe` architecture with linear-attention and MoE
-layers. riallm can parse its nested config and split/load its text weights, while
-interactive inference should use an OpenAI-compatible backend that has already
-loaded the model:
+For Qwen3.6-35B-A3B, point `--model` at the directory that physically contains
+`config.json`, `tokenizer.json`, and the `model-000xx-of-00026.safetensors`
+files:
 
 ```bash
-# Example: after starting vLLM/SGLang/Transformers on port 8000
-OPENAI_BASE_URL=http://127.0.0.1:8000/v1 \
-OPENAI_API_KEY=EMPTY \
-cargo run --bin riallm -- chat --model Qwen/Qwen3.6-35B-A3B --no-thinking
+MODEL_DIR=/path/to/Qwen3.6-35B-A3B
+
+cargo run --bin riallm -- chat \
+  --model "$MODEL_DIR" \
+  --device cpu \
+  --max-new-tokens 8 \
+  --no-thinking
 ```
+
+If riallm is built with CUDA support:
+
+```bash
+cargo run --features cuda --bin riallm -- chat \
+  --model "$MODEL_DIR" \
+  --device cuda:0 \
+  --max-new-tokens 8 \
+  --no-thinking
+```
+
+The first run splits the local safetensors into riallm's cache under
+`~/.cache/riallm/.../split`. Start with a small `--max-new-tokens` value while
+validating the setup; the current native Qwen3.6 path is correctness-first and
+may be slow.
 
 ## 🔧 Architecture
 
@@ -151,7 +172,7 @@ riallm/
 | **Llama** | Llama-2, Llama-3, Vicuna, Alpaca | ✅ |
 | **Qwen** | Qwen-7B, Qwen-14B | ✅ |
 | **Qwen2** | Qwen2-7B, Qwen2-72B | ✅ |
-| **Qwen3.6 MoE** | Qwen/Qwen3.6-35B-A3B metadata/splitting + interactive backend mode | ✅ |
+| **Qwen3.6 MoE** | Qwen/Qwen3.6-35B-A3B text model | ✅ |
 | **Mistral** | Mistral-7B | ✅ |
 | **Mixtral** | Mixtral-8x7B (MoE) | ✅ |
 | **ChatGLM** | ChatGLM2, ChatGLM3 | ✅ |
@@ -166,7 +187,7 @@ Models need to be split into per-layer files:
 
 ```bash
 # The library handles this automatically
-# First load will split the model (takes a few minutes)
+# First load will split the local model into ~/.cache/riallm
 # Subsequent loads use the cached split
 ```
 
@@ -230,6 +251,8 @@ if let Some(profiler) = model.profiler() {
 - **Slower than full model loading**: Each layer loads from disk
 - **Typical overhead**: 2-5x slower than full GPU loading
 - **Benefit**: Can run models that wouldn't fit in GPU otherwise
+- **Qwen3.6 note**: Native Qwen3.6 MoE execution is implemented for direct local
+  testing and prioritizes correctness over throughput.
 
 ## 🛠 Development
 
@@ -260,7 +283,7 @@ cargo run --example basic_usage
 riallm = { version = "0.1.0", features = ["flash-attn"] }
 ```
 
-- `cuda` (default): Enable CUDA support
+- `cuda`: Enable CUDA support
 - `flash-attn`: Enable Flash Attention (faster inference)
 
 ## 📝 Comparison with Python AirLLM

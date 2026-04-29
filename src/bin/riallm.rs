@@ -4,76 +4,17 @@ use std::path::PathBuf;
 use candle_core::{Device, Tensor};
 use riallm::config::{DeviceSpec, ModelOptions};
 use riallm::AutoModel;
-use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
 
 #[derive(Debug)]
 struct ChatArgs {
-    model: String,
-    api_base: Option<String>,
-    api_key: String,
-    native: bool,
+    model_path: PathBuf,
     device: DeviceSpec,
     max_new_tokens: usize,
     temperature: f64,
     top_p: f64,
     system: Option<String>,
     enable_thinking: bool,
-}
-
-impl Default for ChatArgs {
-    fn default() -> Self {
-        Self {
-            model: "Qwen/Qwen3.6-35B-A3B".to_string(),
-            api_base: std::env::var("OPENAI_BASE_URL").ok(),
-            api_key: std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "EMPTY".to_string()),
-            native: false,
-            device: DeviceSpec::Cpu,
-            max_new_tokens: 512,
-            temperature: 0.6,
-            top_p: 0.95,
-            system: None,
-            enable_thinking: true,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Serialize)]
-struct ChatCompletionRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    max_tokens: usize,
-    temperature: f64,
-    top_p: f64,
-    stream: bool,
-    chat_template_kwargs: ChatTemplateKwargs,
-}
-
-#[derive(Serialize)]
-struct ChatTemplateKwargs {
-    enable_thinking: bool,
-}
-
-#[derive(Deserialize)]
-struct ChatCompletionResponse {
-    choices: Vec<ChatChoice>,
-}
-
-#[derive(Deserialize)]
-struct ChatChoice {
-    message: ChatChoiceMessage,
-}
-
-#[derive(Deserialize)]
-struct ChatChoiceMessage {
-    content: Option<String>,
-    reasoning_content: Option<String>,
 }
 
 #[tokio::main]
@@ -84,8 +25,7 @@ async fn main() -> anyhow::Result<()> {
     match command {
         "chat" => {
             argv.remove(0);
-            let args = parse_chat_args(&argv)?;
-            run_chat(args).await
+            run_chat(parse_chat_args(&argv)?).await
         }
         "help" | "--help" | "-h" => {
             print_usage();
@@ -96,94 +36,11 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
-    if args.api_base.is_some() && !args.native {
-        run_api_chat(args).await
-    } else {
-        run_native_chat(args).await
-    }
-}
-
-async fn run_api_chat(args: ChatArgs) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
-    let api_base = args
-        .api_base
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("--api-base or OPENAI_BASE_URL is required"))?;
-    let endpoint = chat_completion_endpoint(api_base);
-    let mut messages = initial_messages(&args);
-
-    println!("riallm chat API mode");
-    println!("model: {}", args.model);
-    println!("endpoint: {}", endpoint);
-    println!("type :quit to exit, :reset to clear the conversation");
-
-    loop {
-        let Some(input) = read_user_input()? else {
-            break;
-        };
-
-        if handle_control(&input, &mut messages, &args) {
-            continue;
-        }
-
-        messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: input,
-        });
-
-        let request = ChatCompletionRequest {
-            model: args.model.clone(),
-            messages: messages.clone(),
-            max_tokens: args.max_new_tokens,
-            temperature: args.temperature,
-            top_p: args.top_p,
-            stream: false,
-            chat_template_kwargs: ChatTemplateKwargs {
-                enable_thinking: args.enable_thinking,
-            },
-        };
-
-        let response = client
-            .post(&endpoint)
-            .bearer_auth(&args.api_key)
-            .json(&request)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("chat completion request failed with {status}: {body}");
-        }
-
-        let response = response.json::<ChatCompletionResponse>().await?;
-        let reply = response
-            .choices
-            .into_iter()
-            .next()
-            .and_then(|choice| choice.message.content.or(choice.message.reasoning_content))
-            .unwrap_or_default();
-
-        println!("\nassistant> {}\n", reply.trim());
-        messages.push(ChatMessage {
-            role: "assistant".to_string(),
-            content: reply,
-        });
+    if !args.model_path.exists() {
+        anyhow::bail!("model path does not exist: {:?}", args.model_path);
     }
 
-    Ok(())
-}
-
-async fn run_native_chat(args: ChatArgs) -> anyhow::Result<()> {
-    let model_path = PathBuf::from(&args.model);
-    if !model_path.exists() {
-        anyhow::bail!(
-            "native chat requires a local model path. For Qwen3.6, start a vLLM/SGLang/Transformers \
-             OpenAI-compatible server and pass --api-base or set OPENAI_BASE_URL."
-        );
-    }
-
-    let tokenizer_path = model_path.join("tokenizer.json");
+    let tokenizer_path = args.model_path.join("tokenizer.json");
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|err| anyhow::anyhow!("failed to load {:?}: {}", tokenizer_path, err))?;
 
@@ -191,11 +48,12 @@ async fn run_native_chat(args: ChatArgs) -> anyhow::Result<()> {
         device: args.device.clone(),
         ..Default::default()
     };
-    let mut model = AutoModel::from_pretrained(&args.model, Some(options)).await?;
+    let mut model =
+        AutoModel::from_pretrained(path_to_str(&args.model_path)?, Some(options)).await?;
     let mut messages = initial_messages(&args);
 
-    println!("riallm chat native mode");
-    println!("model: {}", args.model);
+    println!("riallm native chat");
+    println!("model: {}", args.model_path.display());
     println!("type :quit to exit, :reset to clear the conversation");
 
     loop {
@@ -203,14 +61,18 @@ async fn run_native_chat(args: ChatArgs) -> anyhow::Result<()> {
             break;
         };
 
-        if handle_control(&input, &mut messages, &args) {
-            continue;
+        match input.as_str() {
+            "" => continue,
+            ":quit" | ":exit" => break,
+            ":reset" => {
+                messages = initial_messages(&args);
+                println!("conversation reset");
+                continue;
+            }
+            _ => {}
         }
 
-        messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: input,
-        });
+        messages.push(("user".to_string(), input));
 
         let prompt = render_qwen_chat_prompt(&messages, args.enable_thinking);
         let encoding = tokenizer
@@ -235,52 +97,46 @@ async fn run_native_chat(args: ChatArgs) -> anyhow::Result<()> {
         let reply = trim_generation_stops(&reply).trim().to_string();
 
         println!("\nassistant> {}\n", reply);
-        messages.push(ChatMessage {
-            role: "assistant".to_string(),
-            content: reply,
-        });
+        messages.push(("assistant".to_string(), reply));
     }
 
     Ok(())
 }
 
 fn parse_chat_args(argv: &[String]) -> anyhow::Result<ChatArgs> {
-    let mut args = ChatArgs::default();
+    let mut model_path = std::env::var("RIALLM_MODEL_PATH").ok().map(PathBuf::from);
+    let mut device = DeviceSpec::Cpu;
+    let mut max_new_tokens = 128usize;
+    let mut temperature = 0.0f64;
+    let mut top_p = 1.0f64;
+    let mut system = None;
+    let mut enable_thinking = true;
     let mut index = 0usize;
 
     while index < argv.len() {
         match argv[index].as_str() {
             "--model" | "-m" => {
-                args.model = next_value(argv, &mut index, "--model")?;
-            }
-            "--api-base" => {
-                args.api_base = Some(next_value(argv, &mut index, "--api-base")?);
-            }
-            "--api-key" => {
-                args.api_key = next_value(argv, &mut index, "--api-key")?;
-            }
-            "--native" => {
-                args.native = true;
+                model_path = Some(PathBuf::from(next_value(argv, &mut index, "--model")?));
             }
             "--device" => {
-                args.device = parse_device(&next_value(argv, &mut index, "--device")?)?;
+                device = parse_device(&next_value(argv, &mut index, "--device")?)?;
             }
             "--max-new-tokens" => {
-                args.max_new_tokens =
-                    parse_value(&next_value(argv, &mut index, "--max-new-tokens")?)?;
+                max_new_tokens = parse_value(&next_value(argv, &mut index, "--max-new-tokens")?)?;
             }
             "--temperature" => {
-                args.temperature = parse_value(&next_value(argv, &mut index, "--temperature")?)?;
+                temperature = parse_value(&next_value(argv, &mut index, "--temperature")?)?;
             }
             "--top-p" => {
-                args.top_p = parse_value(&next_value(argv, &mut index, "--top-p")?)?;
+                top_p = parse_value(&next_value(argv, &mut index, "--top-p")?)?;
             }
             "--system" => {
-                args.system = Some(next_value(argv, &mut index, "--system")?);
+                system = Some(next_value(argv, &mut index, "--system")?);
             }
             "--no-thinking" => {
-                args.enable_thinking = false;
+                enable_thinking = false;
             }
+            "--native" => {}
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -291,7 +147,19 @@ fn parse_chat_args(argv: &[String]) -> anyhow::Result<ChatArgs> {
         index += 1;
     }
 
-    Ok(args)
+    let model_path = model_path.ok_or_else(|| {
+        anyhow::anyhow!("--model /path/to/local/model or RIALLM_MODEL_PATH is required")
+    })?;
+
+    Ok(ChatArgs {
+        model_path,
+        device,
+        max_new_tokens,
+        temperature,
+        top_p,
+        system,
+        enable_thinking,
+    })
 }
 
 fn next_value(argv: &[String], index: &mut usize, flag: &str) -> anyhow::Result<String> {
@@ -322,15 +190,10 @@ fn parse_device(value: &str) -> anyhow::Result<DeviceSpec> {
     }
 }
 
-fn initial_messages(args: &ChatArgs) -> Vec<ChatMessage> {
+fn initial_messages(args: &ChatArgs) -> Vec<(String, String)> {
     args.system
         .as_ref()
-        .map(|content| {
-            vec![ChatMessage {
-                role: "system".to_string(),
-                content: content.clone(),
-            }]
-        })
+        .map(|content| vec![("system".to_string(), content.clone())])
         .unwrap_or_default()
 }
 
@@ -347,35 +210,13 @@ fn read_user_input() -> anyhow::Result<Option<String>> {
     Ok(Some(input.trim().to_string()))
 }
 
-fn handle_control(input: &str, messages: &mut Vec<ChatMessage>, args: &ChatArgs) -> bool {
-    match input {
-        "" => true,
-        ":quit" | ":exit" => std::process::exit(0),
-        ":reset" => {
-            *messages = initial_messages(args);
-            println!("conversation reset");
-            true
-        }
-        _ => false,
-    }
-}
-
-fn chat_completion_endpoint(api_base: &str) -> String {
-    let base = api_base.trim_end_matches('/');
-    if base.ends_with("/chat/completions") {
-        base.to_string()
-    } else {
-        format!("{base}/chat/completions")
-    }
-}
-
-fn render_qwen_chat_prompt(messages: &[ChatMessage], enable_thinking: bool) -> String {
+fn render_qwen_chat_prompt(messages: &[(String, String)], enable_thinking: bool) -> String {
     let mut prompt = String::new();
-    for message in messages {
+    for (role, content) in messages {
         prompt.push_str("<|im_start|>");
-        prompt.push_str(&message.role);
+        prompt.push_str(role);
         prompt.push('\n');
-        prompt.push_str(&message.content);
+        prompt.push_str(content);
         prompt.push_str("<|im_end|>\n");
     }
     prompt.push_str("<|im_start|>assistant\n");
@@ -395,22 +236,23 @@ fn trim_generation_stops(text: &str) -> &str {
     &text[..end]
 }
 
+fn path_to_str(path: &PathBuf) -> anyhow::Result<&str> {
+    path.to_str()
+        .ok_or_else(|| anyhow::anyhow!("model path is not valid UTF-8: {:?}", path))
+}
+
 fn print_usage() {
     println!(
         "riallm\n\n\
          Usage:\n  \
-           riallm chat --model /path/to/local/model [--native]\n  \
-           riallm chat --model Qwen/Qwen3.6-35B-A3B --api-base http://127.0.0.1:8000/v1\n\n\
+           riallm chat --model /path/to/local/model [--device cpu]\n\n\
          Chat options:\n  \
-           --model, -m <MODEL>          Local model path or API model id\n  \
-           --api-base <URL>             OpenAI-compatible base URL, also reads OPENAI_BASE_URL\n  \
-           --api-key <KEY>              API key, also reads OPENAI_API_KEY, defaults to EMPTY\n  \
-           --native                     Force native local riallm inference\n  \
-           --device <DEVICE>            cpu, metal, cuda, or cuda:N for native mode\n  \
-           --max-new-tokens <N>         Default: 512\n  \
-           --temperature <FLOAT>        Default: 0.6\n  \
-           --top-p <FLOAT>              Default: 0.95\n  \
+           --model, -m <PATH>           Local Hugging Face model directory\n  \
+           --device <DEVICE>            cpu, metal, cuda, or cuda:N\n  \
+           --max-new-tokens <N>         Default: 128\n  \
+           --temperature <FLOAT>        Parsed for API compatibility; generation is greedy today\n  \
+           --top-p <FLOAT>              Parsed for API compatibility; generation is greedy today\n  \
            --system <TEXT>              Optional system message\n  \
-           --no-thinking                Request no thinking blocks when the backend supports it"
+           --no-thinking                Insert Qwen no-thinking prompt marker"
     );
 }
